@@ -1,0 +1,253 @@
+import os
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import numpy as np
+import math
+
+# 从项目文件中导入模型和数据加载器
+from net import DB_ADMM_Net_RGB
+from data import MultiModal_Dataset
+
+def calculate_psnr(img1, img2, max_val=1.0):
+    """计算两张图像之间的PSNR值"""
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float('inf')
+    return 20 * math.log10(max_val / math.sqrt(mse))
+
+def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
+    """
+    执行一个训练周期的函数
+    """
+    model.train()
+    epoch_loss = 0.0
+    
+    pbar = tqdm(loader, desc='Training', leave=False)
+    for batch in pbar:
+        # 根据新的数据格式解包
+        # 假设 U=rgb, V=nir
+        u_lq = batch['rgb_lq'].to(device)
+        v_lq = batch['nir_lq'].to(device)
+        u_gt = batch['rgb_gt'].to(device)
+        v_gt = batch['nir_gt'].to(device)
+        
+        # 梯度清零
+        optimizer.zero_grad()
+        
+        # 前向传播，输入为低质量图像
+        outputs = model(u_lq, v_lq)
+        
+        # 计算损失，与高质量图像比较
+        total_loss = 0
+        num_stages = len(outputs)
+        for k in range(num_stages):
+            u_k, v_k, _, _ = outputs[k]
+            # L1 Loss
+            loss_u = loss_fn(u_k, u_gt)
+            loss_v = loss_fn(v_k, v_gt)
+            total_loss += stage_weights[k] * (loss_u + loss_v)
+            
+        # 反向传播和优化
+        total_loss.backward()
+        optimizer.step()
+        
+        epoch_loss += total_loss.item()
+        pbar.set_postfix(loss=total_loss.item())
+        
+    return epoch_loss / len(loader)
+
+def test_epoch(model, loader, loss_fn, device, stage_weights):
+    """
+    执行一个验证/测试周期的函数
+    """
+    model.eval()
+    epoch_loss = 0.0
+    total_psnr_u = 0.0
+    total_psnr_v = 0.0
+    
+    with torch.no_grad():
+        pbar = tqdm(loader, desc='Validation', leave=False)
+        for batch in pbar:
+            # 根据新的数据格式解包
+            u_lq = batch['rgb_lq'].to(device)
+            v_lq = batch['nir_lq'].to(device)
+            u_gt = batch['rgb_gt'].to(device)
+            v_gt = batch['nir_gt'].to(device)
+            
+            # 前向传播
+            outputs = model(u_lq, v_lq)
+            
+            # 只评估最后一个阶段的输出
+            u_final, v_final, _, _ = outputs[-1]
+            
+            # 计算损失
+            total_loss = 0
+            num_stages = len(outputs)
+            for k in range(num_stages):
+                u_k, v_k, _, _ = outputs[k]
+                loss_u = loss_fn(u_k, u_gt)
+                loss_v = loss_fn(v_k, v_gt)
+                total_loss += stage_weights[k] * (loss_u + loss_v)
+            
+            epoch_loss += total_loss.item()
+            
+            # 计算最终输出的 PSNR
+            psnr_u = calculate_psnr(u_final, u_gt)
+            psnr_v = calculate_psnr(v_final, v_gt)
+            total_psnr_u += psnr_u
+            total_psnr_v += psnr_v
+            
+            pbar.set_postfix(psnr_u=f"{psnr_u:.2f}", psnr_v=f"{psnr_v:.2f}")
+
+    avg_loss = epoch_loss / len(loader)
+    avg_psnr_u = total_psnr_u / len(loader)
+    avg_psnr_v = total_psnr_v / len(loader)
+    
+    return avg_loss, avg_psnr_u, avg_psnr_v
+
+def main(args):
+    # --- 实验路径设置 ---
+    experiment_path = os.path.join('experiments', args.experiment_name)
+    checkpoint_path = os.path.join(experiment_path, 'checkpoints')
+    tensorboard_path = os.path.join(experiment_path, 'logs')
+    os.makedirs(checkpoint_path, exist_ok=True)
+    os.makedirs(tensorboard_path, exist_ok=True)
+    
+    # --- TensorBoard ---
+    writer = SummaryWriter(log_dir=tensorboard_path)
+
+    # --- 设备设置 ---
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # --- 数据加载 ---
+    modalities = ['rgb', 'nir']
+    train_dataset = MultiModal_Dataset(
+        root_dir=args.data_root,
+        modalities=modalities,
+        patch_size=args.patch_size,
+        is_train=True,
+        jpeg_compress_modalities=args.jpeg_modalities,
+        quality_min=args.qf,
+        quality_max=args.qf
+    )
+    val_dataset = MultiModal_Dataset(
+        root_dir=args.data_root,
+        modalities=modalities,
+        patch_size=args.val_patch_size,
+        is_train=False,
+        jpeg_compress_modalities=args.jpeg_modalities,
+        quality_min=args.qf,
+        quality_max=args.qf
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    # --- 模型、损失函数、优化器 ---
+    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    
+    # 【新增】加载预训练模型
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint: {args.resume}")
+            model.load_state_dict(torch.load(args.resume, map_location=device))
+        else:
+            print(f"Warning: Checkpoint not found at {args.resume}. Training from scratch.")
+
+    loss_fn = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    
+    stage_weights = [1.0] * args.num_stages
+
+    # --- 初始验证 (作为基准) ---
+    print("\n--- Initial Validation (Before Training) ---")
+    initial_val_loss, initial_psnr_u, initial_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
+    best_psnr = (initial_psnr_u + initial_psnr_v) / 2
+    
+    print(f"Initial Val Loss: {initial_val_loss:.4f}")
+    print(f"Initial Val PSNR (U): {initial_psnr_u:.2f} dB")
+    print(f"Initial Val PSNR (V): {initial_psnr_v:.2f} dB")
+    print(f"Initial Best PSNR set to: {best_psnr:.2f} dB")
+    
+    # 记录初始指标
+    writer.add_scalar('Loss/val', initial_val_loss, 0)
+    writer.add_scalar('PSNR/val_U', initial_psnr_u, 0)
+    writer.add_scalar('PSNR/val_V', initial_psnr_v, 0)
+    writer.add_scalar('PSNR/val_avg', best_psnr, 0)
+
+    # 如果没有加载模型，保存一下初始模型作为参考
+    if not args.resume:
+        torch.save(model.state_dict(), os.path.join(checkpoint_path, 'initial_model.pth'))
+
+
+    # --- 训练循环 ---
+    # 【修改】best_psnr 已经被初始化
+    # best_psnr = 0.0
+
+    # 【修改】支持从指定 epoch 开始
+    for epoch in range(args.start_epoch, args.epochs + 1):
+        print(f"\n--- Epoch {epoch}/{args.epochs} ---")
+        
+        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device, stage_weights)
+        val_loss, val_psnr_u, val_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
+        
+        # 调整学习率调度器，使其与当前 epoch 同步
+        # 如果从中间开始，需要先 "快进" scheduler
+        if epoch == args.start_epoch and args.start_epoch > 1:
+            print(f"Advancing scheduler to epoch {epoch-1}")
+            for _ in range(epoch - 1):
+                scheduler.step()
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
+        
+        print(f"Epoch {epoch} Summary:")
+        print(f"  Train Loss: {train_loss:.4f}")
+        print(f"  Val Loss:   {val_loss:.4f}")
+        print(f"  Val PSNR (U): {val_psnr_u:.2f} dB")
+        print(f"  Val PSNR (V): {val_psnr_v:.2f} dB")
+        
+        # 记录到 TensorBoard
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('PSNR/val_U', val_psnr_u, epoch)
+        writer.add_scalar('PSNR/val_V', val_psnr_v, epoch)
+        avg_val_psnr = (val_psnr_u + val_psnr_v) / 2
+        writer.add_scalar('PSNR/val_avg', avg_val_psnr, epoch)
+        writer.add_scalar('learning_rate', current_lr, epoch)
+        
+        if avg_val_psnr > best_psnr:
+            best_psnr = avg_val_psnr
+            save_path = os.path.join(checkpoint_path, 'best_model.pth')
+            torch.save(model.state_dict(), save_path)
+            print(f"  New best model saved to {save_path} (PSNR: {best_psnr:.2f} dB)")
+    
+    writer.close()
+    print("Training finished.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train DB-ADMM-Net for Multi-Modal JPEG Restoration')
+    
+    parser.add_argument('-exp', '--experiment_name', type=str, required=True, help='Name for the experiment')
+    parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--start_epoch', type=int, default=1, help='Epoch to start training from (for resuming)')
+    parser.add_argument('--batch_size', type=int, default=8, help='Training batch size')
+    parser.add_argument('--patch_size', type=int, default=128, help='Image patch size for training')
+    parser.add_argument('--val_patch_size', type=int, default=None, help='Patch size for validation (center crop). If None, use full image.')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network')
+    parser.add_argument('--resume', type=str, default=None, help='Path to the checkpoint to resume training from')
+    
+    # JPEG-related arguments
+    parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression (e.g., rgb nir)')
+    parser.add_argument('--qf', type=int, default=40, help='Fixed JPEG quality factor for compression')
+    
+    args = parser.parse_args()
+    main(args)
