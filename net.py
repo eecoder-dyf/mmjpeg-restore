@@ -86,20 +86,74 @@ class H_Predictor(nn.Module):
 
 class PriorNet(nn.Module):
     """
-    Z-Step: RGB 图像去噪/去伪影
+    Z-Step 升级版: 轻量级 U-Net 去噪器
+    结构: 2次下采样 -> Bottleneck -> 2次上采样
     """
-    def __init__(self, in_channels=3):
+    def __init__(self, in_channels=3, base_dim=32):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            ResBlock(64),
-            ResBlock(64),
-            ResBlock(64), # RGB 信息更丰富，加深一层
-            nn.Conv2d(64, in_channels, 3, 1, 1)
+        
+        # --- Encoder ---
+        # L1: 原始分辨率
+        self.head = nn.Conv2d(in_channels, base_dim, 3, 1, 1)
+        self.enc1 = ResBlock(base_dim)
+        
+        # Down 1 -> L2
+        self.down1 = nn.Conv2d(base_dim, base_dim*2, 3, stride=2, padding=1)
+        self.enc2 = ResBlock(base_dim*2)
+        
+        # Down 2 -> L3 (Bottleneck)
+        self.down2 = nn.Conv2d(base_dim*2, base_dim*4, 3, stride=2, padding=1)
+        self.bottleneck = nn.Sequential(
+            ResBlock(base_dim*4),
+            ResBlock(base_dim*4) # 稍微加深一点瓶颈层
         )
+        
+        # --- Decoder ---
+        # Up 1: L3 -> L2
+        self.up1 = nn.Conv2d(base_dim*4, base_dim*2, 1)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1), # 融合 concat
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim*2)
+        )
+        
+        # Up 2: L2 -> L1
+        self.up2 = nn.Conv2d(base_dim*2, base_dim, 1)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_dim*2, base_dim, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim)
+        )
+        
+        # --- Output ---
+        self.tail = nn.Conv2d(base_dim, in_channels, 3, 1, 1)
+
     def forward(self, x):
-        return x + self.net(x)
+        # input x is usually (U + Y/rho)
+        
+        # Encoder
+        f1 = self.enc1(self.head(x)) # [B, 32, H, W]
+        f2 = self.enc2(self.down1(f1)) # [B, 64, H/2, W/2]
+        f3 = self.bottleneck(self.down2(f2)) # [B, 128, H/4, W/4]
+        
+        # Decoder
+        # Up 1
+        up_f3 = F.interpolate(f3, scale_factor=2, mode='bilinear', align_corners=False)
+        up_f3 = self.up1(up_f3)
+        cat1 = torch.cat([up_f3, f2], dim=1)
+        dec1 = self.dec1(cat1)
+        
+        # Up 2
+        up_dec1 = F.interpolate(dec1, scale_factor=2, mode='bilinear', align_corners=False)
+        up_dec1 = self.up2(up_dec1)
+        cat2 = torch.cat([up_dec1, f1], dim=1)
+        dec2 = self.dec2(cat2)
+        
+        # Residual Learning: Output = Input + Noise_Prediction
+        # 或者直接输出 Clean Image，这里采用 Residual 形式通常更好收敛
+        out = self.tail(dec2)
+        
+        return x + out
     
 class SolverNet(nn.Module):
     """
@@ -351,15 +405,15 @@ class DB_ADMM_Net_RGB(nn.Module):
 # 5. 测试 Demo (RGB)
 # ==========================================
 if __name__ == "__main__":
-    # 配置: Batch=2, Channels=3 (RGB), Size=64x64
-    B, C, H, W = 2, 3, 64, 64
+    # 配置: Batch=1, Channels=3 (RGB), Size=256x256
+    B, C, H, W = 1, 3, 256, 256
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     Ju = torch.randn(B, C, H, W).to(device)
     Jv = torch.randn(B, C, H, W).to(device)
     
     # 实例化 RGB 模型
-    model = DB_ADMM_Net_RGB(num_stages=3, channels=3).to(device)
+    model = DB_ADMM_Net_RGB(num_stages=4, channels=3).to(device)
     
     # 运行
     outputs = model(Ju, Jv)
@@ -373,3 +427,8 @@ if __name__ == "__main__":
     # 验证梯度计算
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total Parameters: {total_params / 1e6:.2f} M")
+    
+    from torchprofile import profile_macs
+    inputs = (Ju, Jv)
+    macs = profile_macs(model, args=inputs)
+    print(f"Model MACs: {macs / 1e9:.4f} G")
