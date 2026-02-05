@@ -1,6 +1,7 @@
 import os
 import argparse
 import torch
+import torch.nn.functional as F # 导入 F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
@@ -33,6 +34,17 @@ def tensor2img(tensor):
     img = np.clip(img, 0, 1)
     img = (img * 255.0).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+def pad_to_multiple(img, multiple):
+    """Pad an image tensor so that its dimensions are a multiple of `multiple`."""
+    h, w = img.shape[-2:]
+    new_h = (h + multiple - 1) // multiple * multiple
+    new_w = (w + multiple - 1) // multiple * multiple
+    pad_h = new_h - h
+    pad_w = new_w - w
+    # The padding format is (pad_left, pad_right, pad_top, pad_bottom)
+    img = F.pad(img, (0, pad_w, 0, pad_h), 'reflect')
+    return img
 
 def main(args):
     # --- 路径设置 ---
@@ -90,9 +102,23 @@ def main(args):
             u_gt = batch['rgb_gt'].to(device)
             v_gt = batch['nir_gt'].to(device)
 
+            # 记录原始尺寸并进行 padding
+            ori_h, ori_w = u_lq.shape[2:]
+            u_lq = pad_to_multiple(u_lq, 4)
+            v_lq = pad_to_multiple(v_lq, 4)
+            # GT 也需要 padding 以便在计算 loss/metric 时尺寸匹配
+            u_gt_padded = pad_to_multiple(u_gt, 4)
+            v_gt_padded = pad_to_multiple(v_gt, 4)
+
             # 前向传播
             outputs = model(u_lq, v_lq)
             u_restored, v_restored, _, _ = outputs[-1]
+
+            # 裁剪恢复的图像和 GT 至原始尺寸
+            u_restored = u_restored[..., :ori_h, :ori_w]
+            v_restored = v_restored[..., :ori_h, :ori_w]
+            # 使用原始未 padding 的 GT 进行指标计算
+            # u_gt 和 v_gt 已经是原始尺寸，无需裁剪
 
             # 计算指标
             psnr_u = calculate_psnr(u_restored, u_gt)
@@ -108,11 +134,12 @@ def main(args):
             # 保存图像
             if args.save_images:
                 base_filename = f"{i:04d}"
+                # 保存的图像是裁剪后的
                 cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_restored.png"), tensor2img(u_restored))
                 cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_restored.png"), tensor2img(v_restored))
-                # 可选：保存输入和GT以供比较
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_lq.png"), tensor2img(u_lq))
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_lq.png"), tensor2img(v_lq))
+                # 可选：保存输入和GT以供比较 (保存原始尺寸的)
+                cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_lq.png"), tensor2img(batch['rgb_lq']))
+                cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_lq.png"), tensor2img(batch['nir_lq']))
                 cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_gt.png"), tensor2img(u_gt))
                 cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_gt.png"), tensor2img(v_gt))
 

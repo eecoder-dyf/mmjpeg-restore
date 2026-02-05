@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import glob
 from tqdm import tqdm
+from skimage.metrics import structural_similarity as ssim
 
 def calculate_psnr(img1, img2):
     """
@@ -15,6 +16,14 @@ def calculate_psnr(img1, img2):
     if mse == 0:
         return float('inf')
     return 20 * np.log10(255.0 / np.sqrt(mse))
+
+def calculate_ssim(img1, img2):
+    """
+    计算两张图像 (numpy 格式, 0-255, BGR) 之间的 SSIM
+    """
+    # ssim 函数要求多通道图像，且需要指定 channel_axis
+    # data_range 是图像的动态范围
+    return ssim(img1, img2, data_range=255.0, channel_axis=2, win_size=11)
 
 def jpeg_compress(img_bgr, quality):
     """
@@ -49,6 +58,7 @@ def main():
     print(f"正在处理 {len(img_paths)} 张图像, QF = {args.qf}...")
     
     psnr_values = []
+    ssim_values = []
 
     for path in tqdm(img_paths):
         # 1. 读取原始图像 (BGR)
@@ -59,16 +69,20 @@ def main():
         # 2. 模拟 JPEG 压缩
         img_lq = jpeg_compress(img_gt, args.qf)
         
-        # 3. 计算 PSNR
+        # 3. 计算 PSNR 和 SSIM
         psnr = calculate_psnr(img_gt, img_lq)
+        ssim_val = calculate_ssim(img_gt, img_lq)
         psnr_values.append(psnr)
+        ssim_values.append(ssim_val)
 
     # 4. 统计结果
     avg_psnr = np.mean(psnr_values)
+    avg_ssim = np.mean(ssim_values)
     print(f"\n--- 结果汇总 ---")
     print(f"处理总数: {len(psnr_values)}")
     print(f"固定 QF : {args.qf}")
     print(f"平均 PSNR: {avg_psnr:.4f} dB")
+    print(f"平均 SSIM: {avg_ssim:.4f}")
 
 if __name__ == '__main__':
     main()

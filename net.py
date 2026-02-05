@@ -100,49 +100,119 @@ class PriorNet(nn.Module):
         )
     def forward(self, x):
         return x + self.net(x)
-
-class Approx_Trans_Block(nn.Module):
-    """
-    模拟 H^T (反投影): 处理 RGB 误差
-    """
-    def __init__(self, in_channels=3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, 1, 1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(32, in_channels, 3, 1, 1)
-        )
-        # 初始化归零
-        nn.init.constant_(self.net[-1].weight, 0)
-        nn.init.constant_(self.net[-1].bias, 0)
-
-    def forward(self, x):
-        return self.net(x)
-
+    
 class SolverNet(nn.Module):
     """
-    牛顿求解器
-    Input Channels = 9 (3 for Image + 3 for Grad + 3 for Hint)
+    多尺度 SolverNet (U-Net 结构, 无额外辅助类版本)
+    输入: [B, 9, H, W] (U, Fu, Hint)
+    输出: [B, 3, H, W] (Delta U)
     """
-    def __init__(self, in_channels=9, out_channels=3):
+    def __init__(self, in_channels=9, out_channels=3, base_dim=32):
         super().__init__()
-        self.head = nn.Conv2d(in_channels, 64, 3, 1, 1)
         
-        # 使用空洞卷积扩大感受野
-        self.body = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=2, dilation=2),
+        # ================== Encoder (编码器) ==================
+        
+        # Level 1: 原始分辨率
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, 3, 1, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=4, dilation=4),
-            nn.ReLU(inplace=True),
-            ResBlock(64),
-            ResBlock(64)
+            ResBlock(base_dim)
         )
-        self.tail = nn.Conv2d(64, out_channels, 3, 1, 1)
+        # Down 1: Level 1 -> Level 2 (使用 Stride=2 卷积下采样)
+        self.down1 = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim*2, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Level 2: 1/2 分辨率
+        self.enc2 = ResBlock(base_dim*2)
+        
+        # Down 2: Level 2 -> Level 3
+        self.down2 = nn.Sequential(
+            nn.Conv2d(base_dim*2, base_dim*4, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ================== Bottleneck (瓶颈层) ==================
+        # Level 3: 1/4 分辨率 (处理全局信息)
+        self.bottleneck = nn.Sequential(
+            ResBlock(base_dim*4),
+            ResBlock(base_dim*4),
+            ResBlock(base_dim*4)
+        )
+        
+        # ================== Decoder (解码器) ==================
+        
+        # Up 1 对应的卷积: Level 3 -> Level 2
+        # 注意：先插值，再过这个卷积将通道数减半
+        self.up1_conv = nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1)
+        
+        # Dec 1: 融合 Skip Connection 后的处理
+        # 输入通道是 base_dim*2 (来自Up) + base_dim*2 (来自Enc2) = base_dim*4
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1), 
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim*2)
+        )
+        
+        # Up 2 对应的卷积: Level 2 -> Level 1
+        self.up2_conv = nn.Conv2d(base_dim*2, base_dim, 3, 1, 1)
+        
+        # Dec 2: 融合 Skip Connection 后的处理
+        # 输入通道是 base_dim (来自Up) + base_dim (来自Enc1) = base_dim*2
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_dim*2, base_dim, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim)
+        )
+        
+        # ================== Output Head (输出头) ==================
+        self.tail = nn.Conv2d(base_dim, out_channels, 3, 1, 1)
+        
+        # 零初始化最后一层，保证初始输出 Delta U 接近 0
+        nn.init.constant_(self.tail.weight, 0)
+        nn.init.constant_(self.tail.bias, 0)
 
     def forward(self, x):
-        feat = self.head(x)
-        feat = self.body(feat) + feat
-        return self.tail(feat)
+        # x: [B, 9, H, W]
+        
+        # --- Encoding ---
+        # L1
+        f1 = self.enc1(x)       # [B, 32, H, W]
+        
+        # Down -> L2
+        f2 = self.down1(f1)     # [B, 64, H/2, W/2]
+        f2 = self.enc2(f2)
+        
+        # Down -> L3
+        f3 = self.down2(f2)     # [B, 128, H/4, W/4]
+        
+        # --- Bottleneck ---
+        feat = self.bottleneck(f3) # [B, 128, H/4, W/4]
+        
+        # --- Decoding ---
+        
+        # 1. Up-sample (L3 -> L2)
+        # 直接使用 functional API 进行双线性插值
+        up_feat1 = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+        up_feat1 = self.up1_conv(up_feat1) # [B, 64, H/2, W/2]
+        
+        # 2. Concat Skip Connection (f2)
+        cat_feat1 = torch.cat([up_feat1, f2], dim=1) # [B, 128, H/2, W/2]
+        dec_feat1 = self.dec1(cat_feat1)
+        
+        # 3. Up-sample (L2 -> L1)
+        up_feat2 = F.interpolate(dec_feat1, scale_factor=2, mode='bilinear', align_corners=False)
+        up_feat2 = self.up2_conv(up_feat2) # [B, 32, H, W]
+        
+        # 4. Concat Skip Connection (f1)
+        cat_feat2 = torch.cat([up_feat2, f1], dim=1) # [B, 64, H, W]
+        dec_feat2 = self.dec2(cat_feat2)
+        
+        # Output
+        out = self.tail(dec_feat2) # [B, 3, H, W]
+        
+        return out
 
 # ==========================================
 # 3. 核心计算模块 (Function Block)
