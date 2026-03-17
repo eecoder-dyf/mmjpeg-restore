@@ -479,7 +479,6 @@ class DB_ADMM_Net_RGB(nn.Module):
         
         # SolverNet 输入9通道(3+3+3)
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
-        self.solver_v = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
 
     def forward(self, J_u, J_v):
         # [B, 3, H, W]
@@ -520,8 +519,7 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.rho, self.lam, mode='V'
             )
             
-            solver_in_v = torch.cat([V, F_v_val, Map_hint], dim=1)
-            delta_V = self.solver_v[k](solver_in_v)
+            delta_V = F_v_val * (-1) * (1 + self.lam + self.rho) # 海森矩阵为单位对角矩阵乘上系数
             V = V + delta_V
             
             # --- Step Y ---
