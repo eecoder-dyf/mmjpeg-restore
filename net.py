@@ -519,7 +519,7 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.rho, self.lam, mode='V'
             )
             
-            delta_V = F_v_val * (-1) * (1 + self.lam + self.rho) # 海森矩阵为单位对角矩阵乘上系数
+            delta_V = F_v_val * (-1) / (1 + self.lam + self.rho) # 海森矩阵为单位对角矩阵乘上系数
             V = V + delta_V
             
             # --- Step Y ---
