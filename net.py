@@ -109,8 +109,6 @@ class ConvBlock(nn.Module):
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, 1, 1),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, 1, 1),
-            nn.LeakyReLU(0.1, inplace=True)
         )
     def forward(self, x):
         return self.net(x)
@@ -234,10 +232,6 @@ class PriorNet(nn.Module):
         
         # Down 2 -> L3 (Bottleneck)
         self.down2 = nn.Conv2d(base_dim*2, base_dim*4, 3, stride=2, padding=1)
-        self.bottleneck = nn.Sequential(
-            ResBlock(base_dim*4),
-            ResBlock(base_dim*4) # 稍微加深一点瓶颈层
-        )
         
         # --- Decoder ---
         # Up 1: L3 -> L2
@@ -245,7 +239,7 @@ class PriorNet(nn.Module):
         self.dec1 = nn.Sequential(
             nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1), # 融合 concat
             nn.ReLU(inplace=True),
-            ResBlock(base_dim*2)
+            nn.Conv2d(base_dim*2, base_dim*2, 3, 1, 1),
         )
         
         # Up 2: L2 -> L1
@@ -253,7 +247,7 @@ class PriorNet(nn.Module):
         self.dec2 = nn.Sequential(
             nn.Conv2d(base_dim*2, base_dim, 3, 1, 1),
             nn.ReLU(inplace=True),
-            ResBlock(base_dim)
+            nn.Conv2d(base_dim, base_dim, 3, 1, 1),
         )
         
         # --- Output ---
@@ -265,7 +259,7 @@ class PriorNet(nn.Module):
         # Encoder
         f1 = self.enc1(self.head(x)) # [B, 32, H, W]
         f2 = self.enc2(self.down1(f1)) # [B, 64, H/2, W/2]
-        f3 = self.bottleneck(self.down2(f2)) # [B, 128, H/4, W/4]
+        f3 = self.down2(f2) # [B, 128, H/4, W/4]
         
         # Decoder
         # Up 1
