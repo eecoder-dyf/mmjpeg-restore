@@ -46,10 +46,20 @@ def pad_to_multiple(img, multiple):
     img = F.pad(img, (0, pad_w, 0, pad_h), 'reflect')
     return img
 
+def load_model_checkpoint(path, model, device):
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model_state_dict = checkpoint['model_state_dict']
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        model_state_dict = checkpoint['state_dict']
+    else:
+        model_state_dict = checkpoint
+    model.load_state_dict(model_state_dict)
+
 def main(args):
     # --- 路径设置 ---
     experiment_path = os.path.join('experiments', args.experiment_name)
-    checkpoint_file = os.path.join(experiment_path, 'checkpoints', 'best_model.pth')
+    checkpoint_file = args.checkpoint or os.path.join(experiment_path, 'checkpoints', 'best_model.pth')
     results_path = os.path.join(experiment_path, f'results_qf{args.qf}')
     if args.save_images:
         os.makedirs(results_path, exist_ok=True)
@@ -78,7 +88,7 @@ def main(args):
 
     # --- 加载模型 ---
     model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
-    model.load_state_dict(torch.load(checkpoint_file, map_location=device))
+    load_model_checkpoint(checkpoint_file, model, device)
     model.eval()
     print(f"Model loaded from {checkpoint_file}")
 
@@ -165,6 +175,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test DB-ADMM-Net for Multi-Modal JPEG Restoration')
     
     parser.add_argument('-exp', '--experiment_name', type=str, required=True, help='Name of the experiment to load the model from')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
     parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network (must match the trained model)')
     
