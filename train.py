@@ -27,7 +27,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
     model.train()
     epoch_loss = 0.0
     
-    pbar = tqdm(loader, desc='Training', leave=False)
+    pbar = tqdm(loader, desc='Training', leave=False, dynamic_ncols=True)
     for batch in pbar:
         # 根据新的数据格式解包
         # 假设 U=rgb, V=nir
@@ -71,7 +71,7 @@ def test_epoch(model, loader, loss_fn, device, stage_weights):
     total_psnr_v = 0.0
     
     with torch.no_grad():
-        pbar = tqdm(loader, desc='Validation', leave=False)
+        pbar = tqdm(loader, desc='Validation', leave=False, dynamic_ncols=True)
         for batch in pbar:
             # 根据新的数据格式解包
             u_lq = batch['rgb_lq'].to(device)
@@ -110,6 +110,43 @@ def test_epoch(model, loader, loss_fn, device, stage_weights):
     
     return avg_loss, avg_psnr_u, avg_psnr_v
 
+def load_checkpoint(path, model, device, optimizer=None, scheduler=None, load_training_state=False):
+    checkpoint = torch.load(path, map_location=device)
+
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model_state_dict = checkpoint['model_state_dict']
+        resumed_epoch = checkpoint.get('epoch')
+        best_psnr = checkpoint.get('best_psnr')
+
+        if load_training_state:
+            optimizer_state_dict = checkpoint.get('optimizer_state_dict')
+            scheduler_state_dict = checkpoint.get('scheduler_state_dict')
+            if optimizer_state_dict is not None and scheduler_state_dict is not None and optimizer is not None and scheduler is not None:
+                optimizer.load_state_dict(optimizer_state_dict)
+                scheduler.load_state_dict(scheduler_state_dict)
+            else:
+                print('Warning: optimizer/scheduler state not found in checkpoint.')
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        model_state_dict = checkpoint['state_dict']
+        resumed_epoch = checkpoint.get('epoch')
+        best_psnr = checkpoint.get('best_psnr')
+    else:
+        model_state_dict = checkpoint
+        resumed_epoch = None
+        best_psnr = None
+
+    model.load_state_dict(model_state_dict)
+    return resumed_epoch, best_psnr
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_psnr):
+    torch.save({
+        'epoch': epoch,
+        'best_psnr': best_psnr,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+    }, path)
+
 def main(args):
     # --- 实验路径设置 ---
     experiment_path = os.path.join('experiments', args.experiment_name)
@@ -117,7 +154,7 @@ def main(args):
     tensorboard_path = os.path.join(experiment_path, 'logs')
     os.makedirs(checkpoint_path, exist_ok=True)
     os.makedirs(tensorboard_path, exist_ok=True)
-    
+
     # --- TensorBoard ---
     writer = SummaryWriter(log_dir=tensorboard_path)
 
@@ -150,69 +187,67 @@ def main(args):
 
     # --- 模型、损失函数、优化器 ---
     model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
-    
-    # 【新增】加载预训练模型
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"Loading checkpoint: {args.resume}")
-            model.load_state_dict(torch.load(args.resume, map_location=device))
-        else:
-            print(f"Warning: Checkpoint not found at {args.resume}. Training from scratch.")
-
     loss_fn = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    
+
     stage_weights = [1.0] * args.num_stages
+    start_epoch = args.start_epoch
+    saved_best_psnr = None
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint: {args.resume}")
+            resumed_epoch, saved_best_psnr = load_checkpoint(
+                args.resume,
+                model,
+                device,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                load_training_state=args.resume_state,
+            )
+            if resumed_epoch is not None and args.resume_state:
+                start_epoch = resumed_epoch + 1
+                print(f"Resuming training from epoch {start_epoch}")
+        else:
+            print(f"Warning: Checkpoint not found at {args.resume}. Training from scratch.")
 
     # --- 初始验证 (作为基准) ---
-    print("\n--- Initial Validation (Before Training) ---")
+    print()
+    print("--- Initial Validation (Before Training) ---")
     initial_val_loss, initial_psnr_u, initial_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
-    best_psnr = (initial_psnr_u + initial_psnr_v) / 2
-    
+    initial_avg_psnr = (initial_psnr_u + initial_psnr_v) / 2
+    best_psnr = saved_best_psnr if saved_best_psnr is not None else initial_avg_psnr
+
     print(f"Initial Val Loss: {initial_val_loss:.4f}")
     print(f"Initial Val PSNR (U): {initial_psnr_u:.2f} dB")
     print(f"Initial Val PSNR (V): {initial_psnr_v:.2f} dB")
-    print(f"Initial Best PSNR set to: {best_psnr:.2f} dB")
-    
+    print(f"Current Best PSNR: {best_psnr:.2f} dB")
+
     # 记录初始指标
-    writer.add_scalar('Loss/val', initial_val_loss, 0)
-    writer.add_scalar('PSNR/val_U', initial_psnr_u, 0)
-    writer.add_scalar('PSNR/val_V', initial_psnr_v, 0)
-    writer.add_scalar('PSNR/val_avg', best_psnr, 0)
-
-    # 如果没有加载模型，保存一下初始模型作为参考
-    if not args.resume:
-        torch.save(model.state_dict(), os.path.join(checkpoint_path, 'initial_model.pth'))
-
+    initial_step = max(0, start_epoch - 1)
+    writer.add_scalar('Loss/val', initial_val_loss, initial_step)
+    writer.add_scalar('PSNR/val_U', initial_psnr_u, initial_step)
+    writer.add_scalar('PSNR/val_V', initial_psnr_v, initial_step)
+    writer.add_scalar('PSNR/val_avg', initial_avg_psnr, initial_step)
 
     # --- 训练循环 ---
-    # 【修改】best_psnr 已经被初始化
-    # best_psnr = 0.0
+    for epoch in range(start_epoch, args.epochs + 1):
+        print()
+        print(f"--- Epoch {epoch}/{args.epochs} ---")
 
-    # 【修改】支持从指定 epoch 开始
-    for epoch in range(args.start_epoch, args.epochs + 1):
-        print(f"\n--- Epoch {epoch}/{args.epochs} ---")
-        
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device, stage_weights)
         val_loss, val_psnr_u, val_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
-        
-        # 调整学习率调度器，使其与当前 epoch 同步
-        # 如果从中间开始，需要先 "快进" scheduler
-        if epoch == args.start_epoch and args.start_epoch > 1:
-            print(f"Advancing scheduler to epoch {epoch-1}")
-            for _ in range(epoch - 1):
-                scheduler.step()
-        
+
         current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
-        
+
         print(f"Epoch {epoch} Summary:")
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Val Loss:   {val_loss:.4f}")
         print(f"  Val PSNR (U): {val_psnr_u:.2f} dB")
         print(f"  Val PSNR (V): {val_psnr_v:.2f} dB")
-        
+
         # 记录到 TensorBoard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
@@ -221,19 +256,28 @@ def main(args):
         avg_val_psnr = (val_psnr_u + val_psnr_v) / 2
         writer.add_scalar('PSNR/val_avg', avg_val_psnr, epoch)
         writer.add_scalar('learning_rate', current_lr, epoch)
-        
+
         if avg_val_psnr > best_psnr:
             best_psnr = avg_val_psnr
             save_path = os.path.join(checkpoint_path, 'best_model.pth')
             torch.save(model.state_dict(), save_path)
             print(f"  New best model saved to {save_path} (PSNR: {best_psnr:.2f} dB)")
-    
+
+        save_checkpoint(
+            os.path.join(checkpoint_path, 'latest_checkpoint.pth'),
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            best_psnr,
+        )
+
     writer.close()
     print("Training finished.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train DB-ADMM-Net for Multi-Modal JPEG Restoration')
-    
+
     parser.add_argument('-exp', '--experiment_name', type=str, required=True, help='Name for the experiment')
     parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
@@ -243,8 +287,9 @@ if __name__ == '__main__':
     parser.add_argument('--val_patch_size', type=int, default=None, help='Patch size for validation (center crop). If None, use full image.')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network')
-    parser.add_argument('--resume', type=str, default=None, help='Path to the checkpoint to resume training from')
-    
+    parser.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
+    parser.add_argument('--resume_state', action='store_true', help='Restore optimizer and scheduler states if available')
+
     # JPEG-related arguments
     parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression (e.g., rgb nir)')
     parser.add_argument('--qf', type=int, default=40, help='Fixed JPEG quality factor for compression')
