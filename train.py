@@ -189,7 +189,7 @@ def main(args):
     model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
     loss_fn = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, mode='min', patience=3)
 
     stage_weights = [1.0] * args.num_stages
     start_epoch = args.start_epoch
@@ -238,9 +238,10 @@ def main(args):
 
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device, stage_weights)
         val_loss, val_psnr_u, val_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
+        avg_val_psnr = (val_psnr_u + val_psnr_v) / 2
 
         current_lr = optimizer.param_groups[0]['lr']
-        scheduler.step()
+        scheduler.step(val_loss)
 
         print(f"Epoch {epoch} Summary:")
         print(f"  Train Loss: {train_loss:.4f}")
@@ -253,7 +254,6 @@ def main(args):
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('PSNR/val_U', val_psnr_u, epoch)
         writer.add_scalar('PSNR/val_V', val_psnr_v, epoch)
-        avg_val_psnr = (val_psnr_u + val_psnr_v) / 2
         writer.add_scalar('PSNR/val_avg', avg_val_psnr, epoch)
         writer.add_scalar('learning_rate', current_lr, epoch)
 
