@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from utils import BlockDCT
 # ==========================================
 # 1. 基础组件 (Basic Components)
 # ==========================================
@@ -405,6 +405,52 @@ class Gradient_Calculator(nn.Module):
         super().__init__()
         # self.approx_HT = Approx_Trans_Block(in_channels=channels) # 移除
         self.dyn_conv = DynamicConv2d_RGB(channels=channels)
+        self.block_dct = BlockDCT(block_size=8)
+
+    def estimate_freq_weight(self, dct_coefs, gamma=10.0):
+        """
+        根据频域统计信息自适应生成 Wu
+        dct_coefs: [B, C, 64, H/8, W/8]
+        """
+        # 1. 计算每个频点在整个空间上的平均能量（绝对值均值或方差）
+        # 在空间维度 H/8 (dim=3) 和 W/8 (dim=4) 上求平均
+        # energy 形状: [B, C, 64, 1, 1]
+        energy = torch.mean(torch.abs(dct_coefs), dim=(3, 4), keepdim=True)
+        
+        # 2. 归一化：为了防止 DC 分量过大，我们可以单独对每个样本除以其自身的 DC 能量
+        # 假设索引 0 是 DC 分量
+        dc_energy = energy[:, :, 0:1, :, :] + 1e-6 
+        normalized_energy = energy / dc_energy  # 映射到 [0, 1] 左右的范围
+        
+        # 3. 映射到置信度 [0, 1]：利用类似 Sigmoid 或指数映射
+        # gamma 是一个控制锐度的超参数
+        Wu = 1.0 - torch.exp(-gamma * normalized_energy)
+        
+        # 强制 DC 分量（索引0）的置信度为 1.0，因为 JPEG 极少破坏 DC
+        Wu[:, :, 0, :, :] = 1.0 
+        
+        return Wu
+    
+    def calculate_fidelity_gradient(self, curr_img, J_obs):
+        """
+        计算频域加权的数据保真项梯度
+        curr_img: 当前优化的图像 U [B, C, H, W]
+        J_obs: 观测到的 JPEG 图像 Ju [B, C, H, W]
+        Wu: 频域置信度权重 [1, 1, 64, 1, 1] (针对64个频点有不同的权重)
+        """
+        # 1. D(U) 和 D(Ju)
+        dct_U = self.block_dct.apply_block_dct(curr_img)  # [B, C, 64, H/8, W/8]
+        dct_J = self.block_dct.apply_block_dct(J_obs)     # [B, C, 64, H/8, W/8]
+        
+        # 2. 频域残差与加权: Wu^2 * (D(U) - D(Ju))
+        # Wu 的形状设计为 [1, 1, 64, 1, 1] 以利用 PyTorch 的广播机制自动应用到所有块上
+        Wu = self.estimate_freq_weight(dct_J) # [B, C, 64, 1, 1]
+        freq_residual = (Wu ** 2) * (dct_U - dct_J)
+        
+        # 3. D^T(...)：逆变换回空间域
+        grad_fidelity = self.block_dct.apply_inverse_block_dct(freq_residual) # [B, C, H, W]
+        
+        return grad_fidelity
 
     def forward(self, curr_img, other_img, J_obs, Y_dual, 
                 h_func_fwd, w_bwd, # 输入变为: 正向函数 + 反向权重
@@ -416,7 +462,7 @@ class Gradient_Calculator(nn.Module):
         grad_prior = Y_dual + rho * (curr_img - Z_est)
 
         # 2. 数据保真梯度
-        grad_data = curr_img - J_obs
+        grad_data = self.calculate_fidelity_gradient(curr_img, J_obs)
 
         # 3. 耦合梯度 (Symmetric Dynamic Stream)
         if mode == 'U':
