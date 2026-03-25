@@ -114,11 +114,9 @@ def main(args):
 
             # 记录原始尺寸并进行 padding
             ori_h, ori_w = u_lq.shape[2:]
-            u_lq = pad_to_multiple(u_lq, 4)
-            v_lq = pad_to_multiple(v_lq, 4)
-            # GT 也需要 padding 以便在计算 loss/metric 时尺寸匹配
-            u_gt_padded = pad_to_multiple(u_gt, 4)
-            v_gt_padded = pad_to_multiple(v_gt, 4)
+            # BlockDCT uses 8x8 blocks, so test inputs must be padded to a multiple of 8.
+            u_lq = pad_to_multiple(u_lq, 8)
+            v_lq = pad_to_multiple(v_lq, 8)
 
             # 前向传播
             outputs = model(u_lq, v_lq)
