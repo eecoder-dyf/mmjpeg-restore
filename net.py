@@ -213,72 +213,88 @@ class H_Predictor(nn.Module):
         
         return w_fwd, w_bwd
 
-class PriorNet(nn.Module):
+class SoftThresholding(nn.Module):
     """
-    Z-Step 升级版: 轻量级 U-Net 去噪器
-    结构: 2次下采样 -> Bottleneck -> 2次上采样
+    可学习的软阈值收缩算子 (Proximal Operator for L1 norm)
     """
-    def __init__(self, in_channels=3, base_dim=32):
+    def __init__(self, channels):
         super().__init__()
-        
-        # --- Encoder ---
-        # L1: 原始分辨率
-        self.head = nn.Conv2d(in_channels, base_dim, 3, 1, 1)
-        self.enc1 = ResBlock(base_dim)
-        
-        # Down 1 -> L2
-        self.down1 = nn.Conv2d(base_dim, base_dim*2, 3, stride=2, padding=1)
-        self.enc2 = ResBlock(base_dim*2)
-        
-        # Down 2 -> L3 (Bottleneck)
-        self.down2 = nn.Conv2d(base_dim*2, base_dim*4, 3, stride=2, padding=1)
-        
-        # --- Decoder ---
-        # Up 1: L3 -> L2
-        self.up1 = nn.Conv2d(base_dim*4, base_dim*2, 1)
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1), # 融合 concat
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base_dim*2, base_dim*2, 3, 1, 1),
-        )
-        
-        # Up 2: L2 -> L1
-        self.up2 = nn.Conv2d(base_dim*2, base_dim, 1)
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(base_dim*2, base_dim, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base_dim, base_dim, 3, 1, 1),
-        )
-        
-        # --- Output ---
-        self.tail = nn.Conv2d(base_dim, in_channels, 3, 1, 1)
+        # 初始化阈值参数，每个通道一个独立的阈值，必须大于0
+        self.theta = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.05)
 
     def forward(self, x):
-        # input x is usually (U + Y/rho)
+        # theta 限制在正数范围内
+        theta = F.relu(self.theta)
+        # Soft-thresholding 公式: sign(x) * max(|x| - theta, 0)
+        return torch.sign(x) * F.relu(torch.abs(x) - theta)
+
+class LCSC_Stage(nn.Module):
+    """
+    ISTA 算法的一个展开层 (Inner Unfolding Stage)
+    """
+    def __init__(self, in_channels=3, num_features=16):
+        super().__init__()
+        # 字典矩阵 (解码器)：将稀疏特征重建为图像
+        self.W_d = nn.Conv2d(num_features, in_channels, kernel_size=3, padding=1, bias=False)
+        # 编码矩阵：将图像残差提取为特征
+        self.W_e = nn.Conv2d(in_channels, num_features, kernel_size=3, padding=1, bias=False)
+        # 软阈值激活函数
+        self.soft_thr = SoftThresholding(num_features)
+
+    def forward(self, M_t, X):
+        """
+        M_t: 上一步的稀疏特征图 [B, num_features, H, W]
+        X: 观测输入 U_tilde [B, C, H, W]
+        """
+        # 1. 重建图像并计算数据残差: (U_tilde - W_d * M_t)
+        # 如果是第一步 (M_t is None)，残差直接是输入 X
+        if M_t is None:
+            residual = X
+            M_t = 0
+        else:
+            X_recon = self.W_d(M_t)
+            residual = X - X_recon
+            
+        # 2. 将残差映射到特征空间并加上过去的特征: M_t + W_e * residual
+        feature_update = M_t + self.W_e(residual)
         
-        # Encoder
-        f1 = self.enc1(self.head(x)) # [B, 32, H, W]
-        f2 = self.enc2(self.down1(f1)) # [B, 64, H/2, W/2]
-        f3 = self.down2(f2) # [B, 128, H/4, W/4]
+        # 3. 软阈值截断，产生极其稀疏且干净的 M_{t+1} (自动切除JPEG马赛克响应)
+        M_next = self.soft_thr(feature_update)
         
-        # Decoder
-        # Up 1
-        up_f3 = F.interpolate(f3, scale_factor=2, mode='bilinear', align_corners=False)
-        up_f3 = self.up1(up_f3)
-        cat1 = torch.cat([up_f3, f2], dim=1)
-        dec1 = self.dec1(cat1)
+        return M_next
+
+class PriorNet(nn.Module):
+    """
+    基于学习卷积稀疏编码的双盲先验网络 (替换原有的 U-Net 黑盒)
+    """
+    def __init__(self, in_channels=3, num_features=16, num_unrolling=6):
+        super().__init__()
+        self.num_unrolling = num_unrolling
         
-        # Up 2
-        up_dec1 = F.interpolate(dec1, scale_factor=2, mode='bilinear', align_corners=False)
-        up_dec1 = self.up2(up_dec1)
-        cat2 = torch.cat([up_dec1, f1], dim=1)
-        dec2 = self.dec2(cat2)
+        # 构建 T 次展开的 LCSC 层
+        # 为了减少参数，这里使用了权重非共享的设计；如果是权重共享，只需实例化一个 LCSC_Stage
+        self.stages = nn.ModuleList([
+            LCSC_Stage(in_channels, num_features) for _ in range(num_unrolling)
+        ])
         
-        # Residual Learning: Output = Input + Noise_Prediction
-        # 或者直接输出 Clean Image，这里采用 Residual 形式通常更好收敛
-        out = self.tail(dec2)
+        # 最终输出的重建字典 (使用最后一次展开层的解码器)
+        self.final_reconstruction = nn.Conv2d(num_features, in_channels, kernel_size=3, padding=1, bias=False)
+
+    def forward(self, u_tilde):
+        """
+        u_tilde: 包含了物理更新但带有伪影的输入 (U + Lambda/rho)
+        """
+        M_t = None
         
-        return x + out
+        # 内层循环：ISTA 算法深度展开
+        for i in range(self.num_unrolling):
+            M_t = self.stages[i](M_t, u_tilde)
+            
+        # 最终重建出极其干净的去噪图像 Z
+        Z_opt = self.final_reconstruction(M_t)
+        
+        # 传统做法会加上一个全局残差连接，保证整体能量不偏移
+        return u_tilde + Z_opt
     
 class SolverNet(nn.Module):
     """
