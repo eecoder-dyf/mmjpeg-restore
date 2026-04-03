@@ -267,7 +267,7 @@ class PriorNet(nn.Module):
     """
     基于学习卷积稀疏编码的双盲先验网络 (替换原有的 U-Net 黑盒)
     """
-    def __init__(self, in_channels=3, num_features=16, num_unrolling=6):
+    def __init__(self, in_channels=3, num_features=32, num_unrolling=6):
         super().__init__()
         self.num_unrolling = num_unrolling
         
