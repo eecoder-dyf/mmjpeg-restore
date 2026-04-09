@@ -13,6 +13,35 @@ import math
 from net import DB_ADMM_Net_RGB
 from data import MultiModal_Dataset
 
+
+def get_base_model(model):
+    """Return the underlying model when wrapped by DataParallel."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def adapt_state_dict_for_model(model, state_dict):
+    """Adapt checkpoint keys between DataParallel and non-DataParallel formats."""
+    base_model = get_base_model(model)
+    model_keys = list(base_model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+
+    if not model_keys or not ckpt_keys:
+        return state_dict
+
+    model_has_module_prefix = model_keys[0].startswith('module.')
+    ckpt_has_module_prefix = ckpt_keys[0].startswith('module.')
+
+    if model_has_module_prefix == ckpt_has_module_prefix:
+        return state_dict
+
+    if ckpt_has_module_prefix and not model_has_module_prefix:
+        return {k[len('module.'):]: v for k, v in state_dict.items()}
+
+    if not ckpt_has_module_prefix and model_has_module_prefix:
+        return {f'module.{k}': v for k, v in state_dict.items()}
+
+    return state_dict
+
 def calculate_psnr(img1, img2, max_val=1.0):
     """计算两张图像之间的PSNR值"""
     mse = torch.mean((img1 - img2) ** 2)
@@ -135,14 +164,17 @@ def load_checkpoint(path, model, device, optimizer=None, scheduler=None, load_tr
         resumed_epoch = None
         best_psnr = None
 
-    model.load_state_dict(model_state_dict)
+    base_model = get_base_model(model)
+    model_state_dict = adapt_state_dict_for_model(base_model, model_state_dict)
+    base_model.load_state_dict(model_state_dict)
     return resumed_epoch, best_psnr
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_psnr):
+    base_model = get_base_model(model)
     torch.save({
         'epoch': epoch,
         'best_psnr': best_psnr,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': base_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
     }, path)
@@ -187,9 +219,12 @@ def main(args):
 
     # --- 模型、损失函数、优化器 ---
     model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    if device.type == 'cuda' and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
     loss_fn = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, mode='min', patience=3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.2, mode='min', patience=20, cooldown=20, min_lr=1e-6)
 
     stage_weights = [1.0] * args.num_stages
     start_epoch = args.start_epoch
@@ -260,7 +295,7 @@ def main(args):
         if avg_val_psnr > best_psnr:
             best_psnr = avg_val_psnr
             save_path = os.path.join(checkpoint_path, 'best_model.pth')
-            torch.save(model.state_dict(), save_path)
+            torch.save(get_base_model(model).state_dict(), save_path)
             print(f"  New best model saved to {save_path} (PSNR: {best_psnr:.2f} dB)")
 
         save_checkpoint(
