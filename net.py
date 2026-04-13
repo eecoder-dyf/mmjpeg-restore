@@ -461,6 +461,55 @@ class Gradient_Calculator(nn.Module):
 # 4. 主网络架构 (DB-ADMM-Net RGB)
 # ==========================================
 
+class Solver_V(nn.Module):
+    def __init__(self, in_channels=3, hidden_dim=16):
+        super().__init__()
+        
+        # 输入: 解析步长 delta_V_math (in_channels) + Map_hint (假设也是 in_channels)
+        self.proj_in = nn.Conv2d(in_channels * 3, hidden_dim, kernel_size=1)
+        
+        # 大核深度可分离卷积 + 归一化 (核心救命稻草！)
+        self.spatial_refine = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=hidden_dim),
+            # 使用 GroupNorm(1, ...) 等价于视觉任务中最稳的 LayerNorm
+            nn.GroupNorm(1, hidden_dim), 
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+        )
+        
+        self.proj_out = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
+        
+        nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.001)
+        nn.init.constant_(self.proj_out.bias, 0.0)
+
+        self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
+
+    def forward(self, V_prev, F_v, Map_hint, lambda_val, rho_val):
+        """
+        显式传入变分参数 lambda_val 和 rho_val
+        """
+        # ==========================================
+        # Step 1: 严格保留数学解析逆计算
+        # ==========================================
+        analytical_step = 1.0 / (1.0 + lambda_val + rho_val)
+        delta_V_math = - analytical_step * F_v
+        
+        # ==========================================
+        # Step 2: 轻量级残差提纯 (精准制导)
+        x = torch.cat([V_prev, F_v, Map_hint], dim=1)
+        
+        feat = self.proj_in(x)
+        feat = self.spatial_refine(feat)
+        residual_correction = self.proj_out(feat)
+        
+        # ==========================================
+        # Step 3: 输出最终的有效更新量 delta_V
+        # ==========================================
+        # 有效更新量 = 纯数学更新量 + 网络的非线性抗噪补偿
+        delta_V = self.alpha * delta_V_math +  residual_correction
+
+        return delta_V
+    
 class DB_ADMM_Net_RGB(nn.Module):
     def __init__(self, num_stages=4, channels=3):
         super().__init__()
@@ -489,6 +538,7 @@ class DB_ADMM_Net_RGB(nn.Module):
         
         # SolverNet 输入9通道(3+3+3)
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
+        self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
 
     def forward(self, J_u, J_v):
         # [B, 3, H, W]
@@ -529,7 +579,7 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.rho, self.lam, mode='V'
             )
             
-            delta_V = F_v_val * (-1) / (1 + self.lam + self.rho) # 海森矩阵为单位对角矩阵乘上系数
+            delta_V = self.solver_v[k](V, F_v_val, Map_hint, self.lam, self.rho)
             V = V + delta_V
             
             # --- Step Y ---
