@@ -114,6 +114,67 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 # ==========================================
+# 2.5 物理算子与注意力模块 (Physical Ops & CGAM)
+# ==========================================
+
+class RGBToY(nn.Module):
+    """
+    RGB -> Y 通道提取 (luminance)
+    输入: [B, 3, H, W], 输出: [B, 1, H, W]
+    """
+    def __init__(self):
+        super().__init__()
+        weights = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer('weights', weights)
+
+    def forward(self, x):
+        return (x * self.weights).sum(dim=1, keepdim=True)
+
+class SobelGradients(nn.Module):
+    """
+    固定权重 Sobel 梯度算子
+    输入: [B, 1, H, W], 输出: (grad_x, grad_y) 形状均为 [B, 1, H, W]
+    """
+    def __init__(self):
+        super().__init__()
+        kernel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0],
+             [-2.0, 0.0, 2.0],
+             [-1.0, 0.0, 1.0]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        kernel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0],
+             [0.0, 0.0, 0.0],
+             [1.0, 2.0, 1.0]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer('kernel_x', kernel_x)
+        self.register_buffer('kernel_y', kernel_y)
+
+    def forward(self, x):
+        grad_x = F.conv2d(x, self.kernel_x, padding=1)
+        grad_y = F.conv2d(x, self.kernel_y, padding=1)
+        return grad_x, grad_y
+
+class CGAM(nn.Module):
+    """
+    Cross-Gradient Attention Module
+    输入: [B, 1, H, W], 输出: [B, 1, H, W]
+    """
+    def __init__(self, hidden_dim=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, hidden_dim, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden_dim, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ==========================================
 # 2. 功能子网络 (Sub-Networks)
 # ==========================================
 
@@ -511,7 +572,7 @@ class Solver_V(nn.Module):
         return delta_V
     
 class DB_ADMM_Net_RGB(nn.Module):
-    def __init__(self, num_stages=4, channels=3):
+    def __init__(self, num_stages=4, channels=3, p_value=0.388):
         super().__init__()
         self.num_stages = num_stages
         self.channels = channels
@@ -540,6 +601,20 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
         self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
 
+        # 物理算子与注意力模块
+        self.rgb_to_y = RGBToY()
+        self.sobel = SobelGradients()
+        self.cgam = nn.ModuleList([CGAM(hidden_dim=16) for _ in range(num_stages)])
+
+        # Fixed p (non-learnable), saved in state_dict via buffer
+        self.register_buffer('p_fixed', torch.tensor(float(p_value)))
+
+    def get_p_values(self):
+        """
+        Return fixed p values per stage.
+        """
+        return [self.p_fixed for _ in range(self.num_stages)]
+
     def forward(self, J_u, J_v):
         # [B, 3, H, W]
         U, V = J_u.clone(), J_v.clone()
@@ -565,9 +640,18 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.prior_u[k], 
                 self.rho, self.lam, mode='U'
             )
+
+            # 物理外积 C_map 与 CGAM 掩码
+            U_y = self.rgb_to_y(U)
+            V_y = self.rgb_to_y(V)
+            grad_ux, grad_uy = self.sobel(U_y)
+            grad_vx, grad_vy = self.sobel(V_y)
+            C_map = torch.abs(grad_ux * grad_vy - grad_uy * grad_vx)
+            M_attn = self.cgam[k](C_map)
             
             # Solver: Concat [U(3), Fu(3), Hint(3)]
             solver_in_u = torch.cat([U, F_u_val, Map_hint], dim=1)
+            solver_in_u = solver_in_u * M_attn
             delta_U = self.solver_u[k](solver_in_u)
             U = U + delta_U
             
@@ -586,7 +670,7 @@ class DB_ADMM_Net_RGB(nn.Module):
             Y_u = Y_u + self.rho * (U - Z_u)
             Y_v = Y_v + self.rho * (V - Z_v)
             
-            outputs.append((U, V, F_u_val, F_v_val))
+            outputs.append((U, V, C_map))
 
         return outputs
 
@@ -606,7 +690,7 @@ if __name__ == "__main__":
     
     # 运行
     outputs = model(Ju, Jv)
-    U_final, V_final, _, _ = outputs[-1]
+    U_final, V_final, _ = outputs[-1]
     
     print(f"Device: {device}")
     print(f"Input Shape: {Ju.shape}")      # [2, 3, 64, 64]

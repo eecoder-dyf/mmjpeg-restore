@@ -54,7 +54,9 @@ def load_model_checkpoint(path, model, device):
         model_state_dict = checkpoint['state_dict']
     else:
         model_state_dict = checkpoint
-    model.load_state_dict(model_state_dict)
+    missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
+    if missing_keys or unexpected_keys:
+        print(f"Warning: load_state_dict missing={missing_keys}, unexpected={unexpected_keys}")
 
 def main(args):
     # --- 路径设置 ---
@@ -87,8 +89,12 @@ def main(args):
     print(f"Found {len(test_dataset)} images for testing.")
 
     # --- 加载模型 ---
-    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    default_p = 0.219
+    p_value = args.p if args.p is not None else default_p
+    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3, p_value=p_value).to(device)
     load_model_checkpoint(checkpoint_file, model, device)
+    if args.p is not None:
+        model.p_fixed.fill_(float(args.p))
     model.eval()
     print(f"Model loaded from {checkpoint_file}")
 
@@ -122,7 +128,7 @@ def main(args):
 
             # 前向传播
             outputs = model(u_lq, v_lq)
-            u_restored, v_restored, _, _ = outputs[-1]
+            u_restored, v_restored, _ = outputs[-1]
 
             # 裁剪恢复的图像和 GT 至原始尺寸
             u_restored = u_restored[..., :ori_h, :ori_w]
@@ -178,6 +184,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
     parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network (must match the trained model)')
+    parser.add_argument('--p', type=float, default=None, help='Fixed p value for prior (if omitted, keep checkpoint value when available)')
     
     # JPEG-related arguments
     parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression')
