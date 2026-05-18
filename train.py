@@ -90,8 +90,11 @@ def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights, alpha)
             # Charbonnier prior loss
             p_k = p_values[k]
             eps = 1e-4
-            b, c, h, w = c_map.shape
-            prior_k = torch.sum((c_map ** 2 + eps ** 2) ** (p_k / 2.0)) / (b * h * w)
+            c_mean = torch.mean(torch.abs(c_map)).detach()
+            # 膨胀因子数学意义：看看当前 batch 下，x^p 的量级比 x^1 (即 L1 范数) 膨胀了多少倍
+            scale_factor = (c_mean ** p_k) / (c_mean + 1e-8)
+            raw_prior_k = torch.mean((c_map ** 2 + eps ** 2) ** (p_k / 2.0))
+            prior_k = raw_prior_k / (scale_factor + 1e-8)
             prior_loss += prior_k
 
         total_loss = total_loss + alpha * prior_loss
@@ -145,8 +148,11 @@ def test_epoch(model, loader, loss_fn, device, stage_weights, alpha):
 
                 p_k = p_values[k]
                 eps = 1e-4
-                b, c, h, w = c_map.shape
-                prior_k = torch.sum((c_map ** 2 + eps ** 2) ** (p_k / 2.0)) / (b * h * w)
+                c_mean = torch.mean(torch.abs(c_map)).detach()
+                # 膨胀因子数学意义：看看当前 batch 下，x^p 的量级比 x^1 (即 L1 范数) 膨胀了多少倍
+                scale_factor = (c_mean ** p_k) / (c_mean + 1e-8)
+                raw_prior_k = torch.mean((c_map ** 2 + eps ** 2) ** (p_k / 2.0))
+                prior_k = raw_prior_k / (scale_factor + 1e-8)
                 prior_loss += prior_k
 
             total_loss = total_loss + alpha * prior_loss
