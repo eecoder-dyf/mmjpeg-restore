@@ -143,15 +143,25 @@ def main(args):
 
             # 保存图像
             if args.save_images:
-                base_filename = f"{i:04d}"
+                save_dirs = {
+                    "rgb_restored": os.path.join(results_path, "rgb_restored"),
+                    "nir_restored": os.path.join(results_path, "nir_restored"),
+                    "rgb_lq": os.path.join(results_path, "rgb_lq"),
+                    "nir_lq": os.path.join(results_path, "nir_lq"),
+                    # "rgb_gt": os.path.join(results_path, "rgb_gt"),
+                    # "nir_gt": os.path.join(results_path, "nir_gt"),
+                }
+                for path in save_dirs.values():
+                    os.makedirs(path, exist_ok=True)
+                base_filename = batch["filename"][0]
                 # 保存的图像是裁剪后的
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_restored.png"), tensor2img(u_restored))
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_restored.png"), tensor2img(v_restored))
+                cv2.imwrite(os.path.join(save_dirs["rgb_restored"], f"{base_filename}.png"), tensor2img(u_restored))
+                cv2.imwrite(os.path.join(save_dirs["nir_restored"], f"{base_filename}.png"), tensor2img(v_restored))
                 # 可选：保存输入和GT以供比较 (保存原始尺寸的)
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_lq.png"), tensor2img(batch['rgb_lq']))
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_lq.png"), tensor2img(batch['nir_lq']))
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_rgb_gt.png"), tensor2img(u_gt))
-                cv2.imwrite(os.path.join(results_path, f"{base_filename}_nir_gt.png"), tensor2img(v_gt))
+                cv2.imwrite(os.path.join(save_dirs["rgb_lq"], f"{base_filename}.png"), tensor2img(batch["rgb_lq"]))
+                cv2.imwrite(os.path.join(save_dirs["nir_lq"], f"{base_filename}.png"), tensor2img(batch["nir_lq"]))
+                # cv2.imwrite(os.path.join(save_dirs["rgb_gt"], f"{base_filename}.png"), tensor2img(u_gt))
+                # cv2.imwrite(os.path.join(save_dirs["nir_gt"], f"{base_filename}.png"), tensor2img(v_gt))
 
     # --- 打印平均结果 ---
     num_images = len(test_loader)
