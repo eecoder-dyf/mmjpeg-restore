@@ -120,6 +120,7 @@ class MultiModal_Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path_group = self.image_paths[index]
+        base_name = os.path.splitext(os.path.basename(path_group[self.modalities[0]]))[0]
         
         # 1. 读取所有模态的原始图像 (Ground Truth)
         img_gt_list = []
@@ -148,6 +149,7 @@ class MultiModal_Dataset(data.Dataset):
         
         # 3. 创建返回字典，包含所有GT图像
         return_dict = {f"{m}_gt": t for m, t in zip(self.modalities, np2tensor(img_gt_list))}
+        return_dict["filename"] = base_name
 
         # 4. 对指定模态进行JPEG压缩，生成LQ输入
         for modality in self.jpeg_compress_modalities:
