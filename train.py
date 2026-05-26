@@ -268,6 +268,8 @@ def main(args):
     stage_weights = [1.0] * args.num_stages
     start_epoch = args.start_epoch
     saved_best_psnr = None
+    val_loss_window = []
+    val_loss_window_size = 5
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -337,7 +339,11 @@ def main(args):
         pK = p_values[-1].item()
 
         current_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_loss)
+        val_loss_window.append(val_loss)
+        if len(val_loss_window) > val_loss_window_size:
+            val_loss_window.pop(0)
+        avg_val_loss = sum(val_loss_window) / len(val_loss_window)
+        scheduler.step(avg_val_loss)
 
         print(f"Epoch {epoch} Summary:")
         print(f"  Train Loss: {train_loss:.4f}")
