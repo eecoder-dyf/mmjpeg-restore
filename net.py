@@ -113,6 +113,84 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class LumaGradient(nn.Module):
+    """
+    RGB/NIR -> luminance -> forward difference gradient.
+    Output channels: [dx, dy].
+    """
+    def __init__(self, channels=3):
+        super().__init__()
+        if channels == 3:
+            weight = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1)
+        else:
+            weight = torch.ones(1, channels, 1, 1, dtype=torch.float32) / channels
+        self.register_buffer('luma_weight', weight)
+
+    def to_luma(self, x):
+        return (x * self.luma_weight).sum(dim=1, keepdim=True)
+
+    def forward(self, x):
+        y = self.to_luma(x)
+        dx = F.pad(y[:, :, :, 1:] - y[:, :, :, :-1], (0, 1, 0, 0))
+        dy = F.pad(y[:, :, 1:, :] - y[:, :, :-1, :], (0, 0, 0, 1))
+        return torch.cat([dx, dy], dim=1)
+
+class HyperLaplacianCGGate(nn.Module):
+    def __init__(
+        self,
+        channels=3,
+        eps=1e-3,
+        p_init=0.3373,
+        mu_init=1.0,
+        detach_gate=True,
+        p_min=1e-3,
+        p_max=0.999,
+    ):
+        super().__init__()
+        self.grad = LumaGradient(channels)
+        self.eps = eps
+        self.detach_gate = detach_gate
+        self.p_min = p_min
+        self.p_max = p_max
+
+        self.p_raw = nn.Parameter(self._p_to_raw(p_init, p_min, p_max))
+        self.mu_raw = nn.Parameter(self._inv_softplus(mu_init))
+
+    def forward(self, U, V):
+        grad_u = self.grad(U)
+        grad_v = self.grad(V)
+
+        c_map = torch.abs(
+            grad_u[:, 0:1] * grad_v[:, 1:2]
+            - grad_u[:, 1:2] * grad_v[:, 0:1]
+        )
+
+        p_shape = self.p_min + (self.p_max - self.p_min) * torch.sigmoid(self.p_raw)
+        mu = F.softplus(self.mu_raw) + 1e-6
+
+        gate = torch.exp(
+            -mu * (c_map.pow(2) + self.eps ** 2).pow(p_shape / 2.0)
+        )
+        gate = torch.clamp(gate, min=0.0, max=1.0)
+
+        if self.detach_gate:
+            gate = gate.detach()
+
+        return gate, c_map, p_shape, mu
+
+    @staticmethod
+    def _inv_softplus(x):
+        x = torch.tensor([x], dtype=torch.float32)
+        return torch.log(torch.expm1(x))
+
+    @staticmethod
+    def _p_to_raw(p_init, p_min, p_max):
+        if not p_min < p_init < p_max:
+            raise ValueError(f"p_init must satisfy {p_min} < p < {p_max}, got {p_init}")
+        p_norm = (float(p_init) - p_min) / (p_max - p_min)
+        p_norm = min(max(p_norm, 1e-6), 1.0 - 1e-6)
+        return torch.tensor([p_norm / (1.0 - p_norm)]).log()
+
 # ==========================================
 # 2. 功能子网络 (Sub-Networks)
 # ==========================================
@@ -424,7 +502,7 @@ class Gradient_Calculator(nn.Module):
 
     def forward(self, curr_img, other_img, J_obs, Y_dual, 
                 h_func_fwd, w_bwd, # 输入变为: 正向函数 + 反向权重
-                prior_net, rho, lam, mode='U'):
+                prior_net, rho, lam, gate=None, mode='U'):
         
         # 1. 嵌入式先验梯度 (Z-Step)
         img_noisy = curr_img + Y_dual / rho
@@ -435,14 +513,20 @@ class Gradient_Calculator(nn.Module):
         grad_data = curr_img - J_obs
 
         # 3. 耦合梯度 (Symmetric Dynamic Stream)
+        if gate is None:
+            gate_rgb = 1.0
+        else:
+            gate_rgb = gate.repeat(1, curr_img.shape[1], 1, 1)
+
         if mode == 'U':
             # E = V - H(U)
             H_U = h_func_fwd(curr_img)
             E_couple = other_img - H_U
+            E_weighted = gate_rgb * E_couple
             
             # 【核心改动】使用动态卷积模拟 H^T
             # 输入是误差 E，权重是专门预测出来的 w_bwd
-            term_couple = self.dyn_conv(E_couple, w_bwd)
+            term_couple = self.dyn_conv(E_weighted, w_bwd)
             
             grad_couple = -lam * term_couple
             
@@ -450,7 +534,8 @@ class Gradient_Calculator(nn.Module):
             # V 的梯度依然简单
             H_U = h_func_fwd(other_img)
             E_couple = curr_img - H_U
-            grad_couple = lam * E_couple
+            E_weighted = gate_rgb * E_couple
+            grad_couple = lam * E_weighted
 
         # 4. 总梯度
         F_val = grad_data + grad_couple + grad_prior
@@ -484,15 +569,19 @@ class Solver_V(nn.Module):
 
         self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
 
-    def forward(self, V_prev, F_v, Map_hint, lambda_val, rho_val):
+    def forward(self, V_prev, F_v, Map_hint, lambda_val, rho_val, gate=None):
         """
         显式传入变分参数 lambda_val 和 rho_val
         """
         # ==========================================
         # Step 1: 严格保留数学解析逆计算
         # ==========================================
-        analytical_step = 1.0 / (1.0 + lambda_val + rho_val)
-        delta_V_math = - analytical_step * F_v
+        if gate is None:
+            denom = 1.0 + lambda_val + rho_val
+        else:
+            gate_rgb = gate.repeat(1, V_prev.shape[1], 1, 1)
+            denom = 1.0 + rho_val + lambda_val * gate_rgb
+        delta_V_math = -F_v / (denom + 1e-6)
         
         # ==========================================
         # Step 2: 轻量级残差提纯 (精准制导)
@@ -511,7 +600,15 @@ class Solver_V(nn.Module):
         return delta_V
     
 class DB_ADMM_Net_RGB(nn.Module):
-    def __init__(self, num_stages=4, channels=3):
+    def __init__(
+        self,
+        num_stages=4,
+        channels=3,
+        p_init=0.3373,
+        mu_init=1.0,
+        cg_eps=1e-3,
+        detach_gate=True,
+    ):
         super().__init__()
         self.num_stages = num_stages
         self.channels = channels
@@ -532,6 +629,16 @@ class DB_ADMM_Net_RGB(nn.Module):
         
         # H_Predictor 输入6通道(3+3)，输出3通道动态核
         self.h_pred = nn.ModuleList([H_Predictor(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
+        self.cg_gate = nn.ModuleList([
+            HyperLaplacianCGGate(
+                channels=channels,
+                eps=cg_eps,
+                p_init=p_init,
+                mu_init=mu_init,
+                detach_gate=detach_gate,
+            )
+            for _ in range(num_stages)
+        ])
         
         self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
@@ -557,17 +664,24 @@ class DB_ADMM_Net_RGB(nn.Module):
             # 预测 H (RGB Dynamic Kernels for Forward and Backward)
             w_fwd, w_bwd = self.h_pred[k](U, V) # w_fwd是正向核，w_bwd是反向核
             h_func_fwd = lambda x: self.dyn_conv_op(x, w_fwd)
+
+            # Hyper-Laplacian cross-gradient gate
+            G_cg, C_cg, p_shape, mu = self.cg_gate[k](U, V)
+            gate_rgb = G_cg.repeat(1, self.channels, 1, 1)
+            Map_gate = Map_hint * gate_rgb
             
             # --- Step U ---
             F_u_val, Z_u = self.grad_calc_u[k](
                 U, V, J_u, Y_u, 
                 h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_u[k], 
-                self.rho, self.lam, mode='U'
+                self.rho, self.lam,
+                gate=G_cg,
+                mode='U'
             )
             
             # Solver: Concat [U(3), Fu(3), Hint(3)]
-            solver_in_u = torch.cat([U, F_u_val, Map_hint], dim=1)
+            solver_in_u = torch.cat([U, F_u_val, Map_gate], dim=1)
             delta_U = self.solver_u[k](solver_in_u)
             U = U + delta_U
             
@@ -576,17 +690,19 @@ class DB_ADMM_Net_RGB(nn.Module):
                 V, U, J_v, Y_v, 
                 h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_v[k], 
-                self.rho, self.lam, mode='V'
+                self.rho, self.lam,
+                gate=G_cg,
+                mode='V'
             )
             
-            delta_V = self.solver_v[k](V, F_v_val, Map_hint, self.lam, self.rho)
+            delta_V = self.solver_v[k](V, F_v_val, Map_gate, self.lam, self.rho, gate=G_cg)
             V = V + delta_V
             
             # --- Step Y ---
             Y_u = Y_u + self.rho * (U - Z_u)
             Y_v = Y_v + self.rho * (V - Z_v)
             
-            outputs.append((U, V, F_u_val, F_v_val))
+            outputs.append((U, V, F_u_val, F_v_val, G_cg, C_cg, p_shape, mu))
 
         return outputs
 
@@ -606,7 +722,7 @@ if __name__ == "__main__":
     
     # 运行
     outputs = model(Ju, Jv)
-    U_final, V_final, _, _ = outputs[-1]
+    U_final, V_final = outputs[-1][0], outputs[-1][1]
     
     print(f"Device: {device}")
     print(f"Input Shape: {Ju.shape}")      # [2, 3, 64, 64]

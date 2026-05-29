@@ -46,6 +46,20 @@ def pad_to_multiple(img, multiple):
     img = F.pad(img, (0, pad_w, 0, pad_h), 'reflect')
     return img
 
+def unpack_stage_output(stage_output):
+    """Return U/V and optional diagnostics from a stage output tuple."""
+    u_k, v_k = stage_output[0], stage_output[1]
+    extra = {}
+    if len(stage_output) > 4:
+        extra['G_cg'] = stage_output[4]
+    if len(stage_output) > 5:
+        extra['C_cg'] = stage_output[5]
+    if len(stage_output) > 6:
+        extra['p_shape'] = stage_output[6]
+    if len(stage_output) > 7:
+        extra['mu'] = stage_output[7]
+    return u_k, v_k, extra
+
 def load_model_checkpoint(path, model, device):
     checkpoint = torch.load(path, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -54,7 +68,12 @@ def load_model_checkpoint(path, model, device):
         model_state_dict = checkpoint['state_dict']
     else:
         model_state_dict = checkpoint
-    model.load_state_dict(model_state_dict)
+    incompatible = model.load_state_dict(model_state_dict, strict=False)
+    missing = [k for k in incompatible.missing_keys if not k.startswith('cg_gate.')]
+    if missing or incompatible.unexpected_keys:
+        print(f"Warning: checkpoint/model key mismatch. Missing: {missing}; Unexpected: {incompatible.unexpected_keys}")
+    elif incompatible.missing_keys:
+        print("Checkpoint does not contain cg_gate parameters; using initialized gate parameters.")
 
 def main(args):
     # --- 路径设置 ---
@@ -87,7 +106,14 @@ def main(args):
     print(f"Found {len(test_dataset)} images for testing.")
 
     # --- 加载模型 ---
-    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    model = DB_ADMM_Net_RGB(
+        num_stages=args.num_stages,
+        channels=3,
+        p_init=args.p_init,
+        mu_init=args.mu_init,
+        cg_eps=args.cg_eps,
+        detach_gate=not args.no_detach_gate,
+    ).to(device)
     load_model_checkpoint(checkpoint_file, model, device)
     model.eval()
     print(f"Model loaded from {checkpoint_file}")
@@ -122,7 +148,7 @@ def main(args):
 
             # 前向传播
             outputs = model(u_lq, v_lq)
-            u_restored, v_restored, _, _ = outputs[-1]
+            u_restored, v_restored, _ = unpack_stage_output(outputs[-1])
 
             # 裁剪恢复的图像和 GT 至原始尺寸
             u_restored = u_restored[..., :ori_h, :ori_w]
@@ -188,6 +214,10 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
     parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network (must match the trained model)')
+    parser.add_argument('--p_init', type=float, default=0.3373, help='Initial Hyper-Laplacian shape parameter for G_cg')
+    parser.add_argument('--mu_init', type=float, default=1.0, help='Initial gate strength parameter for G_cg')
+    parser.add_argument('--cg_eps', type=float, default=1e-3, help='Numerical stability epsilon for G_cg')
+    parser.add_argument('--no_detach_gate', action='store_true', help='Allow gradients through G_cg instead of detaching it')
     
     # JPEG-related arguments
     parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression')

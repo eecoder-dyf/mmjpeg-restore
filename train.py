@@ -49,6 +49,20 @@ def calculate_psnr(img1, img2, max_val=1.0):
         return float('inf')
     return 20 * math.log10(max_val / math.sqrt(mse))
 
+def unpack_stage_output(stage_output):
+    """Return U/V and optional diagnostics from a stage output tuple."""
+    u_k, v_k = stage_output[0], stage_output[1]
+    extra = {}
+    if len(stage_output) > 4:
+        extra['G_cg'] = stage_output[4]
+    if len(stage_output) > 5:
+        extra['C_cg'] = stage_output[5]
+    if len(stage_output) > 6:
+        extra['p_shape'] = stage_output[6]
+    if len(stage_output) > 7:
+        extra['mu'] = stage_output[7]
+    return u_k, v_k, extra
+
 def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
     """
     执行一个训练周期的函数
@@ -75,7 +89,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
         total_loss = 0
         num_stages = len(outputs)
         for k in range(num_stages):
-            u_k, v_k, _, _ = outputs[k]
+            u_k, v_k, _ = unpack_stage_output(outputs[k])
             # L1 Loss
             loss_u = loss_fn(u_k, u_gt)
             loss_v = loss_fn(v_k, v_gt)
@@ -112,13 +126,13 @@ def test_epoch(model, loader, loss_fn, device, stage_weights):
             outputs = model(u_lq, v_lq)
             
             # 只评估最后一个阶段的输出
-            u_final, v_final, _, _ = outputs[-1]
+            u_final, v_final, _ = unpack_stage_output(outputs[-1])
             
             # 计算损失
             total_loss = 0
             num_stages = len(outputs)
             for k in range(num_stages):
-                u_k, v_k, _, _ = outputs[k]
+                u_k, v_k, _ = unpack_stage_output(outputs[k])
                 loss_u = loss_fn(u_k, u_gt)
                 loss_v = loss_fn(v_k, v_gt)
                 total_loss += stage_weights[k] * (loss_u + loss_v)
@@ -166,7 +180,12 @@ def load_checkpoint(path, model, device, optimizer=None, scheduler=None, load_tr
 
     base_model = get_base_model(model)
     model_state_dict = adapt_state_dict_for_model(base_model, model_state_dict)
-    base_model.load_state_dict(model_state_dict)
+    incompatible = base_model.load_state_dict(model_state_dict, strict=False)
+    missing = [k for k in incompatible.missing_keys if not k.startswith('cg_gate.')]
+    if missing or incompatible.unexpected_keys:
+        print(f"Warning: checkpoint/model key mismatch. Missing: {missing}; Unexpected: {incompatible.unexpected_keys}")
+    elif incompatible.missing_keys:
+        print("Checkpoint does not contain cg_gate parameters; using initialized gate parameters.")
     return resumed_epoch, best_psnr
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_psnr):
@@ -218,7 +237,14 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     # --- 模型、损失函数、优化器 ---
-    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    model = DB_ADMM_Net_RGB(
+        num_stages=args.num_stages,
+        channels=3,
+        p_init=args.p_init,
+        mu_init=args.mu_init,
+        cg_eps=args.cg_eps,
+        detach_gate=not args.no_detach_gate,
+    ).to(device)
     if device.type == 'cuda' and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
@@ -328,6 +354,10 @@ if __name__ == '__main__':
     parser.add_argument('--val_patch_size', type=int, default=None, help='Patch size for validation (center crop). If None, use full image.')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network')
+    parser.add_argument('--p_init', type=float, default=0.3373, help='Initial Hyper-Laplacian shape parameter for G_cg')
+    parser.add_argument('--mu_init', type=float, default=1.0, help='Initial gate strength parameter for G_cg')
+    parser.add_argument('--cg_eps', type=float, default=1e-3, help='Numerical stability epsilon for G_cg')
+    parser.add_argument('--no_detach_gate', action='store_true', help='Allow gradients through G_cg instead of detaching it')
     parser.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
     parser.add_argument('--resume_state', action='store_true', help='Restore optimizer and scheduler states if available')
 
