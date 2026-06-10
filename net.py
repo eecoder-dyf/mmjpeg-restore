@@ -299,10 +299,10 @@ class PriorNet(nn.Module):
 class SolverNet(nn.Module):
     """
     多尺度 SolverNet (U-Net 结构, 无额外辅助类版本)
-    输入: [B, 9, H, W] (U, Fu, Hint)
+    输入: [B, 6, H, W] (U, Fu)
     输出: [B, 3, H, W] (Delta U)
     """
-    def __init__(self, in_channels=9, out_channels=3, base_dim=32):
+    def __init__(self, in_channels=6, out_channels=3, base_dim=32):
         super().__init__()
         
         # ================== Encoder (编码器) ==================
@@ -369,7 +369,7 @@ class SolverNet(nn.Module):
         nn.init.constant_(self.tail.bias, 0)
 
     def forward(self, x):
-        # x: [B, 9, H, W]
+        # x: [B, 6, H, W]
         
         # --- Encoding ---
         # L1
@@ -465,8 +465,7 @@ class Solver_V(nn.Module):
     def __init__(self, in_channels=3, hidden_dim=16):
         super().__init__()
         
-        # 输入: 解析步长 delta_V_math (in_channels) + Map_hint (假设也是 in_channels)
-        self.proj_in = nn.Conv2d(in_channels * 3, hidden_dim, kernel_size=1)
+        self.proj_in = nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1)
         
         # 大核深度可分离卷积 + 归一化 (核心救命稻草！)
         self.spatial_refine = nn.Sequential(
@@ -484,7 +483,7 @@ class Solver_V(nn.Module):
 
         self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
 
-    def forward(self, V_prev, F_v, Map_hint, lambda_val, rho_val):
+    def forward(self, V_prev, F_v, lambda_val, rho_val):
         """
         显式传入变分参数 lambda_val 和 rho_val
         """
@@ -496,7 +495,7 @@ class Solver_V(nn.Module):
         
         # ==========================================
         # Step 2: 轻量级残差提纯 (精准制导)
-        x = torch.cat([V_prev, F_v, Map_hint], dim=1)
+        x = torch.cat([V_prev, F_v], dim=1)
         
         feat = self.proj_in(x)
         feat = self.spatial_refine(feat)
@@ -520,9 +519,6 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.rho = nn.Parameter(torch.tensor([0.1]))
         self.lam = nn.Parameter(torch.tensor([0.5]))
         
-        # 初始 H (3->3) 用于全局差分先验
-        self.h_init = nn.Conv2d(channels, channels, 3, 1, 1, bias=False)
-        
         # 动态卷积算子 (RGB版)
         self.dyn_conv_op = DynamicConv2d_RGB(channels=channels, kernel_size=3)
         
@@ -536,8 +532,8 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         
-        # SolverNet 输入9通道(3+3+3)
-        self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
+        # SolverNet 输入6通道(3+3)
+        self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
         self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
 
     def forward(self, J_u, J_v):
@@ -546,11 +542,6 @@ class DB_ADMM_Net_RGB(nn.Module):
         Y_u = torch.zeros_like(U)
         Y_v = torch.zeros_like(V)
         
-        # 差分先验 (RGB Difference Map)
-        with torch.no_grad():
-            init_proj = self.h_init(J_u)
-            Map_hint = J_v - init_proj 
-
         outputs = []
         
         for k in range(self.num_stages):
@@ -566,8 +557,8 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.rho, self.lam, mode='U'
             )
             
-            # Solver: Concat [U(3), Fu(3), Hint(3)]
-            solver_in_u = torch.cat([U, F_u_val, Map_hint], dim=1)
+            # Solver: Concat [U(3), Fu(3)]
+            solver_in_u = torch.cat([U, F_u_val], dim=1)
             delta_U = self.solver_u[k](solver_in_u)
             U = U + delta_U
             
@@ -579,7 +570,7 @@ class DB_ADMM_Net_RGB(nn.Module):
                 self.rho, self.lam, mode='V'
             )
             
-            delta_V = self.solver_v[k](V, F_v_val, Map_hint, self.lam, self.rho)
+            delta_V = self.solver_v[k](V, F_v_val, self.lam, self.rho)
             V = V + delta_V
             
             # --- Step Y ---
