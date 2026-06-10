@@ -87,7 +87,13 @@ def main(args):
     print(f"Found {len(test_dataset)} images for testing.")
 
     # --- 加载模型 ---
-    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    model = DB_ADMM_Net_RGB(
+        num_stages=args.num_stages,
+        channels=3,
+        mu_c=args.mu_c,
+        p_c=args.p_c,
+        eps_c=args.eps_c,
+    ).to(device)
     load_model_checkpoint(checkpoint_file, model, device)
     model.eval()
     print(f"Model loaded from {checkpoint_file}")
@@ -116,13 +122,9 @@ def main(args):
             ori_h, ori_w = u_lq.shape[2:]
             u_lq = pad_to_multiple(u_lq, 4)
             v_lq = pad_to_multiple(v_lq, 4)
-            # GT 也需要 padding 以便在计算 loss/metric 时尺寸匹配
-            u_gt_padded = pad_to_multiple(u_gt, 4)
-            v_gt_padded = pad_to_multiple(v_gt, 4)
-
             # 前向传播
             outputs = model(u_lq, v_lq)
-            u_restored, v_restored, _, _ = outputs[-1]
+            u_restored, v_restored, _, _, _ = outputs[-1]
 
             # 裁剪恢复的图像和 GT 至原始尺寸
             u_restored = u_restored[..., :ori_h, :ori_w]
@@ -186,8 +188,11 @@ if __name__ == '__main__':
     
     parser.add_argument('-exp', '--experiment_name', type=str, required=True, help='Name of the experiment to load the model from')
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
-    parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/RGB-NIR'), help='Root directory of the dataset')
+    parser.add_argument('--data_root', type=str, default=os.path.expanduser('~/database/worldstart'), help='Root directory of the dataset')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network (must match the trained model)')
+    parser.add_argument('--mu_c', type=float, default=0.01, help='Initial weight for the cross-gradient prior term')
+    parser.add_argument('--p_c', type=float, default=0.8, help='Exponent for the cross-gradient prior')
+    parser.add_argument('--eps_c', type=float, default=1e-3, help='Epsilon for the cross-gradient prior')
     
     # JPEG-related arguments
     parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression')

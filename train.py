@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -49,12 +50,40 @@ def calculate_psnr(img1, img2, max_val=1.0):
         return float('inf')
     return 20 * math.log10(max_val / math.sqrt(mse))
 
-def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
+def get_model_attr(model, name):
+    return getattr(get_base_model(model), name)
+
+
+def compute_stage_losses(outputs, u_gt, v_gt, loss_fn, stage_weights, p_c, eps_c):
+    rec_loss = 0
+    c_loss = 0
+    fun_loss = 0
+    num_stages = len(outputs)
+
+    for k, output in enumerate(outputs):
+        u_k, v_k, f_u_k, f_v_k, c_map_k = output
+        loss_u = loss_fn(u_k, u_gt)
+        loss_v = loss_fn(v_k, v_gt)
+        rec_loss = rec_loss + stage_weights[k] * (loss_u + loss_v)
+        c_loss = c_loss + torch.mean(torch.pow(c_map_k + eps_c, p_c))
+        fun_loss = fun_loss + (torch.mean(torch.abs(f_u_k)) + torch.mean(torch.abs(f_v_k)))
+
+    c_loss = c_loss / num_stages
+    fun_loss = fun_loss / num_stages
+    return rec_loss, c_loss, fun_loss
+
+
+def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights, c_loss_weight, fun_loss_weight):
     """
     执行一个训练周期的函数
     """
     model.train()
     epoch_loss = 0.0
+    epoch_rec_loss = 0.0
+    epoch_c_loss = 0.0
+    epoch_fun_loss = 0.0
+    p_c = get_model_attr(model, 'p_c')
+    eps_c = get_model_attr(model, 'eps_c')
     
     pbar = tqdm(loader, desc='Training', leave=False, dynamic_ncols=True)
     for batch in pbar:
@@ -71,33 +100,41 @@ def train_epoch(model, loader, optimizer, loss_fn, device, stage_weights):
         # 前向传播，输入为低质量图像
         outputs = model(u_lq, v_lq)
         
-        # 计算损失，与高质量图像比较
-        total_loss = 0
-        num_stages = len(outputs)
-        for k in range(num_stages):
-            u_k, v_k, _, _ = outputs[k]
-            # L1 Loss
-            loss_u = loss_fn(u_k, u_gt)
-            loss_v = loss_fn(v_k, v_gt)
-            total_loss += stage_weights[k] * (loss_u + loss_v)
+        # 计算重建损失、cross-gradient prior loss 和 function solving loss
+        rec_loss, c_loss, fun_loss = compute_stage_losses(outputs, u_gt, v_gt, loss_fn, stage_weights, p_c, eps_c)
+        total_loss = rec_loss + c_loss_weight * c_loss + fun_loss_weight * fun_loss
             
         # 反向传播和优化
         total_loss.backward()
         optimizer.step()
         
         epoch_loss += total_loss.item()
-        pbar.set_postfix(loss=total_loss.item())
+        epoch_rec_loss += rec_loss.item()
+        epoch_c_loss += c_loss.item()
+        epoch_fun_loss += fun_loss.item()
+        pbar.set_postfix(loss=total_loss.item(), rec=rec_loss.item())
         
-    return epoch_loss / len(loader)
+    num_batches = len(loader)
+    return {
+        'total': epoch_loss / num_batches,
+        'rec': epoch_rec_loss / num_batches,
+        'c_prior': epoch_c_loss / num_batches,
+        'function': epoch_fun_loss / num_batches,
+    }
 
-def test_epoch(model, loader, loss_fn, device, stage_weights):
+def test_epoch(model, loader, loss_fn, device, stage_weights, c_loss_weight=0.0, fun_loss_weight=0.0):
     """
     执行一个验证/测试周期的函数
     """
     model.eval()
     epoch_loss = 0.0
+    epoch_rec_loss = 0.0
+    epoch_c_loss = 0.0
+    epoch_fun_loss = 0.0
     total_psnr_u = 0.0
     total_psnr_v = 0.0
+    p_c = get_model_attr(model, 'p_c')
+    eps_c = get_model_attr(model, 'eps_c')
     
     with torch.no_grad():
         pbar = tqdm(loader, desc='Validation', leave=False, dynamic_ncols=True)
@@ -112,18 +149,16 @@ def test_epoch(model, loader, loss_fn, device, stage_weights):
             outputs = model(u_lq, v_lq)
             
             # 只评估最后一个阶段的输出
-            u_final, v_final, _, _ = outputs[-1]
+            u_final, v_final, _, _, _ = outputs[-1]
             
             # 计算损失
-            total_loss = 0
-            num_stages = len(outputs)
-            for k in range(num_stages):
-                u_k, v_k, _, _ = outputs[k]
-                loss_u = loss_fn(u_k, u_gt)
-                loss_v = loss_fn(v_k, v_gt)
-                total_loss += stage_weights[k] * (loss_u + loss_v)
+            rec_loss, c_loss, fun_loss = compute_stage_losses(outputs, u_gt, v_gt, loss_fn, stage_weights, p_c, eps_c)
+            total_loss = rec_loss + c_loss_weight * c_loss + fun_loss_weight * fun_loss
             
             epoch_loss += total_loss.item()
+            epoch_rec_loss += rec_loss.item()
+            epoch_c_loss += c_loss.item()
+            epoch_fun_loss += fun_loss.item()
             
             # 计算最终输出的 PSNR
             psnr_u = calculate_psnr(u_final, u_gt)
@@ -133,11 +168,18 @@ def test_epoch(model, loader, loss_fn, device, stage_weights):
             
             pbar.set_postfix(psnr_u=f"{psnr_u:.2f}", psnr_v=f"{psnr_v:.2f}")
 
-    avg_loss = epoch_loss / len(loader)
-    avg_psnr_u = total_psnr_u / len(loader)
-    avg_psnr_v = total_psnr_v / len(loader)
+    num_batches = len(loader)
+    avg_loss = epoch_loss / num_batches
+    avg_psnr_u = total_psnr_u / num_batches
+    avg_psnr_v = total_psnr_v / num_batches
+    metrics = {
+        'total': avg_loss,
+        'rec': epoch_rec_loss / num_batches,
+        'c_prior': epoch_c_loss / num_batches,
+        'function': epoch_fun_loss / num_batches,
+    }
     
-    return avg_loss, avg_psnr_u, avg_psnr_v
+    return metrics, avg_psnr_u, avg_psnr_v
 
 def load_checkpoint(path, model, device, optimizer=None, scheduler=None, load_training_state=False):
     checkpoint = torch.load(path, map_location=device)
@@ -218,7 +260,13 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     # --- 模型、损失函数、优化器 ---
-    model = DB_ADMM_Net_RGB(num_stages=args.num_stages, channels=3).to(device)
+    model = DB_ADMM_Net_RGB(
+        num_stages=args.num_stages,
+        channels=3,
+        mu_c=args.mu_c,
+        p_c=args.p_c,
+        eps_c=args.eps_c,
+    ).to(device)
     if device.type == 'cuda' and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
@@ -252,18 +300,29 @@ def main(args):
     # --- 初始验证 (作为基准) ---
     print()
     print("--- Initial Validation (Before Training) ---")
-    initial_val_loss, initial_psnr_u, initial_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
+    initial_val_metrics, initial_psnr_u, initial_psnr_v = test_epoch(
+        model,
+        val_loader,
+        loss_fn,
+        device,
+        stage_weights,
+        c_loss_weight=args.c_loss_weight,
+        fun_loss_weight=args.fun_loss_weight,
+    )
     initial_avg_psnr = (initial_psnr_u + initial_psnr_v) / 2
     best_psnr = saved_best_psnr if saved_best_psnr is not None else initial_avg_psnr
 
-    print(f"Initial Val Loss: {initial_val_loss:.4f}")
+    print(f"Initial Val Loss: {initial_val_metrics['total']:.4f}")
     print(f"Initial Val PSNR (U): {initial_psnr_u:.2f} dB")
     print(f"Initial Val PSNR (V): {initial_psnr_v:.2f} dB")
     print(f"Current Best PSNR: {best_psnr:.2f} dB")
 
     # 记录初始指标
     initial_step = max(0, start_epoch - 1)
-    writer.add_scalar('Loss/val', initial_val_loss, initial_step)
+    writer.add_scalar('Loss/val', initial_val_metrics['total'], initial_step)
+    writer.add_scalar('Loss/val_rec', initial_val_metrics['rec'], initial_step)
+    writer.add_scalar('Loss/val_c_prior', initial_val_metrics['c_prior'], initial_step)
+    writer.add_scalar('Loss/val_function', initial_val_metrics['function'], initial_step)
     writer.add_scalar('PSNR/val_U', initial_psnr_u, initial_step)
     writer.add_scalar('PSNR/val_V', initial_psnr_v, initial_step)
     writer.add_scalar('PSNR/val_avg', initial_avg_psnr, initial_step)
@@ -273,30 +332,60 @@ def main(args):
         print()
         print(f"--- Epoch {epoch}/{args.epochs} ---")
 
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device, stage_weights)
-        val_loss, val_psnr_u, val_psnr_v = test_epoch(model, val_loader, loss_fn, device, stage_weights)
+        train_metrics = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            loss_fn,
+            device,
+            stage_weights,
+            c_loss_weight=args.c_loss_weight,
+            fun_loss_weight=args.fun_loss_weight,
+        )
+        val_metrics, val_psnr_u, val_psnr_v = test_epoch(
+            model,
+            val_loader,
+            loss_fn,
+            device,
+            stage_weights,
+            c_loss_weight=args.c_loss_weight,
+            fun_loss_weight=args.fun_loss_weight,
+        )
         avg_val_psnr = (val_psnr_u + val_psnr_v) / 2
 
         current_lr = optimizer.param_groups[0]['lr']
-        val_loss_window.append(val_loss)
+        val_loss_window.append(val_metrics['total'])
         if len(val_loss_window) > val_loss_window_size:
             val_loss_window.pop(0)
         avg_val_loss = sum(val_loss_window) / len(val_loss_window)
         scheduler.step(avg_val_loss)
 
         print(f"Epoch {epoch} Summary:")
-        print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Val Loss:   {val_loss:.4f}")
+        print(f"  Train Loss: {train_metrics['total']:.4f}")
+        print(f"  Val Loss:   {val_metrics['total']:.4f}")
         print(f"  Val PSNR (U): {val_psnr_u:.2f} dB")
         print(f"  Val PSNR (V): {val_psnr_v:.2f} dB")
 
         # 记录到 TensorBoard
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Loss/train', train_metrics['total'], epoch)
+        writer.add_scalar('Loss/rec', train_metrics['rec'], epoch)
+        writer.add_scalar('Loss/c_prior', train_metrics['c_prior'], epoch)
+        writer.add_scalar('Loss/function', train_metrics['function'], epoch)
+        writer.add_scalar('Loss/train_rec', train_metrics['rec'], epoch)
+        writer.add_scalar('Loss/train_c_prior', train_metrics['c_prior'], epoch)
+        writer.add_scalar('Loss/train_function', train_metrics['function'], epoch)
+        writer.add_scalar('Loss/val', val_metrics['total'], epoch)
+        writer.add_scalar('Loss/val_rec', val_metrics['rec'], epoch)
+        writer.add_scalar('Loss/val_c_prior', val_metrics['c_prior'], epoch)
+        writer.add_scalar('Loss/val_function', val_metrics['function'], epoch)
         writer.add_scalar('PSNR/val_U', val_psnr_u, epoch)
         writer.add_scalar('PSNR/val_V', val_psnr_v, epoch)
         writer.add_scalar('PSNR/val_avg', avg_val_psnr, epoch)
         writer.add_scalar('learning_rate', current_lr, epoch)
+        base_model = get_base_model(model)
+        writer.add_scalar('Params/rho', F.softplus(base_model.rho).item(), epoch)
+        writer.add_scalar('Params/lambda', F.softplus(base_model.lam).item(), epoch)
+        writer.add_scalar('Params/mu_c', F.softplus(base_model.mu_c).item(), epoch)
 
         if avg_val_psnr > best_psnr:
             best_psnr = avg_val_psnr
@@ -328,6 +417,11 @@ if __name__ == '__main__':
     parser.add_argument('--val_patch_size', type=int, default=None, help='Patch size for validation (center crop). If None, use full image.')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network')
+    parser.add_argument('--mu_c', type=float, default=0.01, help='Initial weight for the cross-gradient prior term')
+    parser.add_argument('--p_c', type=float, default=0.8, help='Exponent for the cross-gradient prior')
+    parser.add_argument('--eps_c', type=float, default=1e-3, help='Epsilon for the cross-gradient prior')
+    parser.add_argument('--c_loss_weight', type=float, default=0.0, help='Weight for cross-gradient prior loss')
+    parser.add_argument('--fun_loss_weight', type=float, default=0.0, help='Weight for function solving loss')
     parser.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint or full training checkpoint')
     parser.add_argument('--resume_state', action='store_true', help='Restore optimizer and scheduler states if available')
 

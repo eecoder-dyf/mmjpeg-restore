@@ -299,10 +299,10 @@ class PriorNet(nn.Module):
 class SolverNet(nn.Module):
     """
     多尺度 SolverNet (U-Net 结构, 无额外辅助类版本)
-    输入: [B, 9, H, W] (U, Fu, Hint)
+    输入: [B, 6, H, W] (U, Fu)
     输出: [B, 3, H, W] (Delta U)
     """
-    def __init__(self, in_channels=9, out_channels=3, base_dim=32):
+    def __init__(self, in_channels=6, out_channels=3, base_dim=32):
         super().__init__()
         
         # ================== Encoder (编码器) ==================
@@ -369,7 +369,7 @@ class SolverNet(nn.Module):
         nn.init.constant_(self.tail.bias, 0)
 
     def forward(self, x):
-        # x: [B, 9, H, W]
+        # x: [B, 6, H, W]
         
         # --- Encoding ---
         # L1
@@ -413,6 +413,62 @@ class SolverNet(nn.Module):
 # 3. 核心计算模块 (Function Block)
 # ==========================================
 
+class CrossGradientPrior(nn.Module):
+    """
+    Cross-gradient prior for the non-smooth structure consistency term.
+    Uses forward finite differences and their exact adjoint operators.
+    """
+    def __init__(self, channels=3, q_max=10.0):
+        super().__init__()
+        self.channels = channels
+        self.q_max = q_max
+
+    @staticmethod
+    def diff_x(x):
+        out = torch.zeros_like(x)
+        out[:, :, :, :-1] = x[:, :, :, 1:] - x[:, :, :, :-1]
+        return out
+
+    @staticmethod
+    def diff_y(x):
+        out = torch.zeros_like(x)
+        out[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+        return out
+
+    @staticmethod
+    def diff_x_t(x):
+        out = torch.zeros_like(x)
+        g = x[:, :, :, :-1]
+        out[:, :, :, :-1] -= g
+        out[:, :, :, 1:] += g
+        return out
+
+    @staticmethod
+    def diff_y_t(x):
+        out = torch.zeros_like(x)
+        g = x[:, :, :-1, :]
+        out[:, :, :-1, :] -= g
+        out[:, :, 1:, :] += g
+        return out
+
+    def forward(self, U, V, p=0.8, eps=1e-3):
+        U_x = self.diff_x(U)
+        U_y = self.diff_y(U)
+        V_x = self.diff_x(V)
+        V_y = self.diff_y(V)
+
+        L = U_x * V_y - U_y * V_x
+        C_map = torch.abs(L)
+
+        # torch.sign represents one valid generalized derivative choice at L=0.
+        q = p * torch.pow(C_map + eps, p - 1.0) * torch.sign(L)
+        q = torch.clamp(q, min=-self.q_max, max=self.q_max)
+
+        Fu_C = self.diff_x_t(q * V_y) - self.diff_y_t(q * V_x)
+        Fv_C = self.diff_y_t(q * U_x) - self.diff_x_t(q * U_y)
+
+        return Fu_C, Fv_C, C_map
+
 class Gradient_Calculator(nn.Module):
     """
     计算 F(U) (3通道版本)
@@ -424,7 +480,7 @@ class Gradient_Calculator(nn.Module):
 
     def forward(self, curr_img, other_img, J_obs, Y_dual, 
                 h_func_fwd, w_bwd, # 输入变为: 正向函数 + 反向权重
-                prior_net, rho, lam, mode='U'):
+                prior_net, rho, lam, mode='U', cross_grad_term=None, mu=0.0):
         
         # 1. 嵌入式先验梯度 (Z-Step)
         img_noisy = curr_img + Y_dual / rho
@@ -454,6 +510,8 @@ class Gradient_Calculator(nn.Module):
 
         # 4. 总梯度
         F_val = grad_data + grad_couple + grad_prior
+        if cross_grad_term is not None:
+            F_val = F_val + mu * cross_grad_term
         
         return F_val, Z_est
 
@@ -465,8 +523,8 @@ class Solver_V(nn.Module):
     def __init__(self, in_channels=3, hidden_dim=16):
         super().__init__()
         
-        # 输入: 解析步长 delta_V_math (in_channels) + Map_hint (假设也是 in_channels)
-        self.proj_in = nn.Conv2d(in_channels * 3, hidden_dim, kernel_size=1)
+        # 输入: V_prev (in_channels) + F_v (in_channels)
+        self.proj_in = nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1)
         
         # 大核深度可分离卷积 + 归一化 (核心救命稻草！)
         self.spatial_refine = nn.Sequential(
@@ -484,9 +542,10 @@ class Solver_V(nn.Module):
 
         self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
 
-    def forward(self, V_prev, F_v, Map_hint, lambda_val, rho_val):
+    def forward(self, V_prev, F_v, lambda_val, rho_val):
         """
-        显式传入变分参数 lambda_val 和 rho_val
+        显式传入变分参数 lambda_val 和 rho_val。
+        解析步对应原二次部分，网络残差补偿非光滑 C 项与动态耦合误差。
         """
         # ==========================================
         # Step 1: 严格保留数学解析逆计算
@@ -496,7 +555,7 @@ class Solver_V(nn.Module):
         
         # ==========================================
         # Step 2: 轻量级残差提纯 (精准制导)
-        x = torch.cat([V_prev, F_v, Map_hint], dim=1)
+        x = torch.cat([V_prev, F_v], dim=1)
         
         feat = self.proj_in(x)
         feat = self.spatial_refine(feat)
@@ -511,20 +570,21 @@ class Solver_V(nn.Module):
         return delta_V
     
 class DB_ADMM_Net_RGB(nn.Module):
-    def __init__(self, num_stages=4, channels=3):
+    def __init__(self, num_stages=4, channels=3, mu_c=0.01, p_c=0.8, eps_c=1e-3, q_max_c=10.0):
         super().__init__()
         self.num_stages = num_stages
         self.channels = channels
+        self.p_c = p_c
+        self.eps_c = eps_c
         
         # 参数
-        self.rho = nn.Parameter(torch.tensor([0.1]))
-        self.lam = nn.Parameter(torch.tensor([0.5]))
-        
-        # 初始 H (3->3) 用于全局差分先验
-        self.h_init = nn.Conv2d(channels, channels, 3, 1, 1, bias=False)
+        self.rho = nn.Parameter(self._inverse_softplus_tensor(0.1))
+        self.lam = nn.Parameter(self._inverse_softplus_tensor(0.5))
+        self.mu_c = nn.Parameter(self._inverse_softplus_tensor(mu_c))
         
         # 动态卷积算子 (RGB版)
         self.dyn_conv_op = DynamicConv2d_RGB(channels=channels, kernel_size=3)
+        self.cross_grad_prior = CrossGradientPrior(channels=channels, q_max=q_max_c)
         
         # 模块列表
         self.prior_u = nn.ModuleList([PriorNet(channels) for _ in range(num_stages)])
@@ -536,9 +596,14 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         
-        # SolverNet 输入9通道(3+3+3)
-        self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*3, out_channels=channels) for _ in range(num_stages)])
+        # SolverNet 输入6通道(3+3)
+        self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
         self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
+
+    @staticmethod
+    def _inverse_softplus_tensor(value):
+        value = torch.tensor([value], dtype=torch.float32)
+        return torch.log(torch.expm1(value))
 
     def forward(self, J_u, J_v):
         # [B, 3, H, W]
@@ -546,14 +611,14 @@ class DB_ADMM_Net_RGB(nn.Module):
         Y_u = torch.zeros_like(U)
         Y_v = torch.zeros_like(V)
         
-        # 差分先验 (RGB Difference Map)
-        with torch.no_grad():
-            init_proj = self.h_init(J_u)
-            Map_hint = J_v - init_proj 
-
         outputs = []
+        rho = F.softplus(self.rho)
+        lam = F.softplus(self.lam)
+        mu_c = F.softplus(self.mu_c)
         
         for k in range(self.num_stages):
+            Fu_C, Fv_C, C_map = self.cross_grad_prior(U, V, p=self.p_c, eps=self.eps_c)
+
             # 预测 H (RGB Dynamic Kernels for Forward and Backward)
             w_fwd, w_bwd = self.h_pred[k](U, V) # w_fwd是正向核，w_bwd是反向核
             h_func_fwd = lambda x: self.dyn_conv_op(x, w_fwd)
@@ -563,11 +628,11 @@ class DB_ADMM_Net_RGB(nn.Module):
                 U, V, J_u, Y_u, 
                 h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_u[k], 
-                self.rho, self.lam, mode='U'
+                rho, lam, mode='U', cross_grad_term=Fu_C, mu=mu_c
             )
             
-            # Solver: Concat [U(3), Fu(3), Hint(3)]
-            solver_in_u = torch.cat([U, F_u_val, Map_hint], dim=1)
+            # Solver: Concat [U(3), Fu(3)]
+            solver_in_u = torch.cat([U, F_u_val], dim=1)
             delta_U = self.solver_u[k](solver_in_u)
             U = U + delta_U
             
@@ -576,17 +641,17 @@ class DB_ADMM_Net_RGB(nn.Module):
                 V, U, J_v, Y_v, 
                 h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_v[k], 
-                self.rho, self.lam, mode='V'
+                rho, lam, mode='V', cross_grad_term=Fv_C, mu=mu_c
             )
             
-            delta_V = self.solver_v[k](V, F_v_val, Map_hint, self.lam, self.rho)
+            delta_V = self.solver_v[k](V, F_v_val, lam, rho)
             V = V + delta_V
             
             # --- Step Y ---
-            Y_u = Y_u + self.rho * (U - Z_u)
-            Y_v = Y_v + self.rho * (V - Z_v)
+            Y_u = Y_u + rho * (U - Z_u)
+            Y_v = Y_v + rho * (V - Z_v)
             
-            outputs.append((U, V, F_u_val, F_v_val))
+            outputs.append((U, V, F_u_val, F_v_val, C_map))
 
         return outputs
 
@@ -606,12 +671,13 @@ if __name__ == "__main__":
     
     # 运行
     outputs = model(Ju, Jv)
-    U_final, V_final, _, _ = outputs[-1]
+    U_final, V_final, _, _, C_map = outputs[-1]
     
     print(f"Device: {device}")
     print(f"Input Shape: {Ju.shape}")      # [2, 3, 64, 64]
     print(f"Output U Shape: {U_final.shape}") # [2, 3, 64, 64]
     print(f"Output V Shape: {V_final.shape}") # [2, 3, 64, 64]
+    print(f"C Map Shape: {C_map.shape}")
     
     # 验证梯度计算
     total_params = sum(p.numel() for p in model.parameters())
