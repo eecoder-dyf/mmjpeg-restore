@@ -138,19 +138,14 @@ class H_Predictor(nn.Module):
         
         # --- Bottleneck (Transformer / Cross-Interaction) ---
         # 在 1/4 尺度上进行全局/大窗口交互
-        self.bottleneck = nn.ModuleList([
-            TransformerBlock(dim=base_dim*4, window_size=(window_size, window_size), num_heads=num_heads),
-            TransformerBlock(dim=base_dim*4, window_size=(window_size, window_size), num_heads=num_heads)
-        ])
+        self.bottleneck = TransformerBlock(dim=base_dim*4, window_size=(window_size, window_size), num_heads=num_heads)
         
         # --- Decoder (CNN) ---
-        # Up 1 -> Level 2
-        self.up1 = nn.Conv2d(base_dim*4, base_dim*2, 1) # Reduce channels
-        self.dec1 = ConvBlock(base_dim*4, base_dim*2)   # Input = Cat(Up, Enc2)
+        self.sfb1 = SFB(base_dim*2, x_dim=base_dim*4, y_dim=base_dim*2)
+        self.dec1 = ConvBlock(base_dim*2, base_dim*2)
         
-        # Up 2 -> Level 1
-        self.up2 = nn.Conv2d(base_dim*2, base_dim, 1)
-        self.dec2 = ConvBlock(base_dim*2, base_dim)     # Input = Cat(Up, Enc1)
+        self.sfb2 = SFB(base_dim, x_dim=base_dim*2, y_dim=base_dim)
+        self.dec2 = ConvBlock(base_dim, base_dim)
         
         # --- Output Head ---
         self.head = nn.Conv2d(base_dim, self.out_dim * 2, 1)
@@ -170,8 +165,7 @@ class H_Predictor(nn.Module):
         x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
         
         # Apply Transformer Blocks
-        for blk in self.bottleneck:
-            x_win = blk(x_win)
+        x_win = self.bottleneck(x_win)
             
         # Reverse: [B*num_windows, Wh*Ww, C] -> [B, C, H, W]
         x = x_win.view(B, H_pad // self.window_size, W_pad // self.window_size, self.window_size, self.window_size, C)
@@ -195,17 +189,13 @@ class H_Predictor(nn.Module):
         feat_bot = self.forward_transformer(f3)
         
         # 4. Decoder Path
-        # Up 1
         up1 = F.interpolate(feat_bot, size=f2.shape[-2:], mode='bilinear', align_corners=False)
-        up1 = self.up1(up1)
-        cat1 = torch.cat([up1, f2], dim=1)
-        dec1 = self.dec1(cat1)
+        fused1 = self.sfb1(up1, f2)
+        dec1 = self.dec1(fused1)
         
-        # Up 2
         up2 = F.interpolate(dec1, size=f1.shape[-2:], mode='bilinear', align_corners=False)
-        up2 = self.up2(up2)
-        cat2 = torch.cat([up2, f1], dim=1)
-        dec2 = self.dec2(cat2)
+        fused2 = self.sfb2(up2, f1)
+        dec2 = self.dec2(fused2)
         
         # 5. Prediction
         kernels = self.head(dec2)
@@ -295,7 +285,32 @@ class PriorNet(nn.Module):
         
         # 传统做法会加上一个全局残差连接，保证整体能量不偏移
         return u_tilde + Z_opt
-    
+
+class SFB(nn.Module):
+    def __init__(self, dim, ratio=4, x_dim=None, y_dim=None):
+        super().__init__()
+        x_dim = dim if x_dim is None else x_dim
+        y_dim = dim if y_dim is None else y_dim
+        hidden_dim = max(dim // ratio, 1)
+        self.x_proj = nn.Identity() if x_dim == dim else nn.Conv2d(x_dim, dim, kernel_size=1, bias=False)
+        self.y_proj = nn.Identity() if y_dim == dim else nn.Conv2d(y_dim, dim, kernel_size=1, bias=False)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.reduce = nn.Conv2d(dim, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False)
+        self.expand = nn.Conv2d(hidden_dim, dim * 2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, y):
+        x = self.x_proj(x)
+        y = self.y_proj(y)
+        x_pool = self.pool(x)
+        y_pool = self.pool(y)
+        att = x_pool * y_pool
+
+        att = self.relu(self.reduce(att))
+        x_weight, y_weight = self.sigmoid(self.expand(att)).chunk(2, dim=1)
+        return x * x_weight + y * y_weight
+
 class SolverNet(nn.Module):
     """
     多尺度 SolverNet (U-Net 结构, 无额外辅助类版本)
@@ -330,11 +345,7 @@ class SolverNet(nn.Module):
         
         # ================== Bottleneck (瓶颈层) ==================
         # Level 3: 1/4 分辨率 (处理全局信息)
-        self.bottleneck = nn.Sequential(
-            ResBlock(base_dim*4),
-            ResBlock(base_dim*4),
-            ResBlock(base_dim*4)
-        )
+        self.bottleneck = ResBlock(base_dim*4)
         
         # ================== Decoder (解码器) ==================
         
@@ -342,24 +353,18 @@ class SolverNet(nn.Module):
         # 注意：先插值，再过这个卷积将通道数减半
         self.up1_conv = nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1)
         
-        # Dec 1: 融合 Skip Connection 后的处理
-        # 输入通道是 base_dim*2 (来自Up) + base_dim*2 (来自Enc2) = base_dim*4
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(base_dim*4, base_dim*2, 3, 1, 1), 
-            nn.ReLU(inplace=True),
-            ResBlock(base_dim*2)
-        )
+        self.sfb1 = SFB(base_dim*2)
+
+        # Dec 1: SFB 融合 Skip Connection 后的处理
+        self.dec1 = ResBlock(base_dim*2)
         
         # Up 2 对应的卷积: Level 2 -> Level 1
         self.up2_conv = nn.Conv2d(base_dim*2, base_dim, 3, 1, 1)
         
-        # Dec 2: 融合 Skip Connection 后的处理
-        # 输入通道是 base_dim (来自Up) + base_dim (来自Enc1) = base_dim*2
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(base_dim*2, base_dim, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            ResBlock(base_dim)
-        )
+        self.sfb2 = SFB(base_dim)
+
+        # Dec 2: SFB 融合 Skip Connection 后的处理
+        self.dec2 = ResBlock(base_dim)
         
         # ================== Output Head (输出头) ==================
         self.tail = nn.Conv2d(base_dim, out_channels, 3, 1, 1)
@@ -392,17 +397,17 @@ class SolverNet(nn.Module):
         up_feat1 = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
         up_feat1 = self.up1_conv(up_feat1) # [B, 64, H/2, W/2]
         
-        # 2. Concat Skip Connection (f2)
-        cat_feat1 = torch.cat([up_feat1, f2], dim=1) # [B, 128, H/2, W/2]
-        dec_feat1 = self.dec1(cat_feat1)
+        # 2. SFB Skip Fusion (f2)
+        fused_feat1 = self.sfb1(up_feat1, f2) # [B, 64, H/2, W/2]
+        dec_feat1 = self.dec1(fused_feat1)
         
         # 3. Up-sample (L2 -> L1)
         up_feat2 = F.interpolate(dec_feat1, scale_factor=2, mode='bilinear', align_corners=False)
         up_feat2 = self.up2_conv(up_feat2) # [B, 32, H, W]
         
-        # 4. Concat Skip Connection (f1)
-        cat_feat2 = torch.cat([up_feat2, f1], dim=1) # [B, 64, H, W]
-        dec_feat2 = self.dec2(cat_feat2)
+        # 4. SFB Skip Fusion (f1)
+        fused_feat2 = self.sfb2(up_feat2, f1) # [B, 32, H, W]
+        dec_feat2 = self.dec2(fused_feat2)
         
         # Output
         out = self.tail(dec_feat2) # [B, 3, H, W]
@@ -526,8 +531,8 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.prior_u = nn.ModuleList([PriorNet(channels) for _ in range(num_stages)])
         self.prior_v = nn.ModuleList([PriorNet(channels) for _ in range(num_stages)])
         
-        # H_Predictor 输入6通道(3+3)，输出3通道动态核
-        self.h_pred = nn.ModuleList([H_Predictor(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
+        # H_Predictor 输入6通道(3+3)，输出3通道动态核；所有 stage 共享同一套参数
+        self.h_pred = H_Predictor(in_channels=channels*2, out_channels=channels)
         
         self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
@@ -546,7 +551,7 @@ class DB_ADMM_Net_RGB(nn.Module):
         
         for k in range(self.num_stages):
             # 预测 H (RGB Dynamic Kernels for Forward and Backward)
-            w_fwd, w_bwd = self.h_pred[k](U, V) # w_fwd是正向核，w_bwd是反向核
+            w_fwd, w_bwd = self.h_pred(U, V) # w_fwd是正向核，w_bwd是反向核
             h_func_fwd = lambda x: self.dyn_conv_op(x, w_fwd)
             
             # --- Step U ---
