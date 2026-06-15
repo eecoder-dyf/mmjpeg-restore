@@ -26,7 +26,7 @@ def calculate_ssim(img1, img2):
     # SSIM 需要 HWC 格式, 且数据范围为 [0, 1]
     img1_np = img1.squeeze().cpu().numpy().transpose(1, 2, 0)
     img2_np = img2.squeeze().cpu().numpy().transpose(1, 2, 0)
-    return ssim(img1_np, img2_np, data_range=1.0, channel_axis=2, win_size=11)
+    return ssim(img1_np, img2_np, data_range=1.0, channel_axis=2, win_size=11, gaussian_weights=True, sigma=1.5)
 
 def tensor2img(tensor):
     """将 tensor [C, H, W] 转换为 BGR uint8 图像 [H, W, C]"""
