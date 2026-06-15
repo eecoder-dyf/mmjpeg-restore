@@ -23,7 +23,7 @@ def calculate_ssim(img1, img2):
     """
     # ssim 函数要求多通道图像，且需要指定 channel_axis
     # data_range 是图像的动态范围
-    return ssim(img1, img2, data_range=255.0, channel_axis=2, win_size=11)
+    return ssim(img1, img2, data_range=255.0, channel_axis=2, win_size=11, gaussian_weights=True, sigma=1.5)
 
 def jpeg_compress(img_bgr, quality):
     """
