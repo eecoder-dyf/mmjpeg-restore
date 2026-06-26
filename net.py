@@ -415,13 +415,52 @@ class SolverNet(nn.Module):
 
 class CrossGradientPrior(nn.Module):
     """
-    Cross-gradient prior for the non-smooth structure consistency term.
-    Uses forward finite differences and their exact adjoint operators.
+    Gray-domain cross-gradient prior.
+
+    The hyper-Laplacian prior is applied to:
+        C_g(U, V) = | grad(G_u(U)) x grad(G_v(V)) |
+
+    where G_u and G_v are fixed gray/luminance projections.
+
+    Output:
+        Fu_C: [B, C, H, W], gradient wrt original U
+        Fv_C: [B, C, H, W], gradient wrt original V
+        C_map: [B, 1, H, W], gray-domain cross-gradient magnitude
     """
-    def __init__(self, channels=3, q_max=10.0):
+    def __init__(
+        self,
+        channels=3,
+        q_max=10.0,
+        u_gray_weights=(0.299, 0.587, 0.114),
+        v_gray_weights=None,
+    ):
         super().__init__()
         self.channels = channels
         self.q_max = q_max
+
+        # U is visible RGB by default
+        if channels == 3:
+            u_w = torch.tensor(u_gray_weights, dtype=torch.float32).view(1, 3, 1, 1)
+        elif channels == 1:
+            u_w = torch.ones(1, 1, 1, 1, dtype=torch.float32)
+        else:
+            # fallback: average all channels
+            u_w = torch.ones(1, channels, 1, 1, dtype=torch.float32) / channels
+
+        # V is NIR. If V is stored as 3 channels, use average by default.
+        # If your NIR is duplicated into 3 channels, average and luminance are almost equivalent.
+        if v_gray_weights is None:
+            if channels == 3:
+                v_w = torch.ones(1, 3, 1, 1, dtype=torch.float32) / 3.0
+            elif channels == 1:
+                v_w = torch.ones(1, 1, 1, 1, dtype=torch.float32)
+            else:
+                v_w = torch.ones(1, channels, 1, 1, dtype=torch.float32) / channels
+        else:
+            v_w = torch.tensor(v_gray_weights, dtype=torch.float32).view(1, channels, 1, 1)
+
+        self.register_buffer("u_gray_weight", u_w)
+        self.register_buffer("v_gray_weight", v_w)
 
     @staticmethod
     def diff_x(x):
@@ -451,21 +490,48 @@ class CrossGradientPrior(nn.Module):
         out[:, :, 1:, :] += g
         return out
 
+    def to_gray_u(self, U):
+        # U: [B, C, H, W] -> [B, 1, H, W]
+        return (U * self.u_gray_weight).sum(dim=1, keepdim=True)
+
+    def to_gray_v(self, V):
+        # V: [B, C, H, W] -> [B, 1, H, W]
+        return (V * self.v_gray_weight).sum(dim=1, keepdim=True)
+
+    def gray_grad_to_u_channels(self, grad_gray):
+        # chain rule: dPhi/dU_c = w_c * dPhi/dG_u(U)
+        return grad_gray * self.u_gray_weight
+
+    def gray_grad_to_v_channels(self, grad_gray):
+        # chain rule: dPhi/dV_c = w_c * dPhi/dG_v(V)
+        return grad_gray * self.v_gray_weight
+
     def forward(self, U, V, p=0.8, eps=1e-3):
-        U_x = self.diff_x(U)
-        U_y = self.diff_y(U)
-        V_x = self.diff_x(V)
-        V_y = self.diff_y(V)
+        # 1. Project to gray/luminance domain
+        U_g = self.to_gray_u(U)
+        V_g = self.to_gray_v(V)
 
+        # 2. Compute gray-domain gradients
+        U_x = self.diff_x(U_g)
+        U_y = self.diff_y(U_g)
+        V_x = self.diff_x(V_g)
+        V_y = self.diff_y(V_g)
+
+        # 3. Cross-gradient determinant
         L = U_x * V_y - U_y * V_x
-        C_map = torch.abs(L)
+        C_map = torch.abs(L)   # [B, 1, H, W]
 
-        # torch.sign represents one valid generalized derivative choice at L=0.
+        # 4. Hyper-Laplacian generalized derivative
         q = p * torch.pow(C_map + eps, p - 1.0) * torch.sign(L)
         q = torch.clamp(q, min=-self.q_max, max=self.q_max)
 
-        Fu_C = self.diff_x_t(q * V_y) - self.diff_y_t(q * V_x)
-        Fv_C = self.diff_y_t(q * U_x) - self.diff_x_t(q * U_y)
+        # 5. Gradient wrt gray U and gray V
+        Fu_gray = self.diff_x_t(q * V_y) - self.diff_y_t(q * V_x)
+        Fv_gray = self.diff_y_t(q * U_x) - self.diff_x_t(q * U_y)
+
+        # 6. Chain rule: gray-domain gradient -> original channel-domain gradient
+        Fu_C = self.gray_grad_to_u_channels(Fu_gray)
+        Fv_C = self.gray_grad_to_v_channels(Fv_gray)
 
         return Fu_C, Fv_C, C_map
 
