@@ -6,43 +6,6 @@ import torch.nn.functional as F
 # 1. 基础组件 (Basic Components)
 # ==========================================
 
-class DynamicConv2d_RGB(nn.Module):
-    """
-    [升级版] 支持多通道的像素级动态卷积
-    采用 Depthwise 策略：每个通道拥有独立的动态核
-    """
-    def __init__(self, channels=3, kernel_size=3):
-        super().__init__()
-        self.channels = channels
-        self.ks = kernel_size
-        self.pad = kernel_size // 2
-
-    def forward(self, x, weights):
-        """
-        x: [B, 3, H, W]
-        weights: [B, 3 * K*K, H, W] -> 每个通道独立的 K*K 核
-        """
-        B, C, H, W = x.shape
-        
-        # 1. Unfold Input -> [B, C*K*K, HW]
-        # x_unfold 包含了每个像素周围的 K*K 邻域
-        x_unfold = F.unfold(x, self.ks, padding=self.pad)
-        
-        # 2. Reshape Input & Weights for Depthwise Operation
-        # x_unfold: [B, C, K*K, HW]
-        x_unfold = x_unfold.view(B, C, self.ks**2, H * W)
-        
-        # weights: [B, C, K*K, HW]
-        w_reshape = weights.view(B, C, self.ks**2, H * W)
-        
-        # 3. Apply Weights (Pixel-wise Dot Product & Sum over kernel window)
-        # 对应位置相乘，并在 K*K 维度上求和 -> 卷积操作
-        out = (x_unfold * w_reshape).sum(dim=2) 
-        
-        # 4. Reshape back to Image
-        out = out.view(B, C, H, W)
-        return out
-
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -539,13 +502,25 @@ class Gradient_Calculator(nn.Module):
     """
     计算 F(U) (3通道版本)
     """
-    def __init__(self, channels=3):
+    def __init__(self, channels=3, hidden_dim=16):
         super().__init__()
-        # self.approx_HT = Approx_Trans_Block(in_channels=channels) # 移除
-        self.dyn_conv = DynamicConv2d_RGB(channels=channels)
+        self.h_fun_fwd = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=3, padding=1, bias=False, padding_mode='reflect')
+        )
+
+        self.h_fun_bwd = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=3, padding=1, bias=False, padding_mode='reflect')
+        )
 
     def forward(self, curr_img, other_img, J_obs, Y_dual, 
-                h_func_fwd, w_bwd, # 输入变为: 正向函数 + 反向权重
                 prior_net, rho, lam, mode='U', cross_grad_term=None, mu=0.0):
         
         # 1. 嵌入式先验梯度 (Z-Step)
@@ -559,19 +534,19 @@ class Gradient_Calculator(nn.Module):
         # 3. 耦合梯度 (Symmetric Dynamic Stream)
         if mode == 'U':
             # E = V - H(U)
-            H_U = h_func_fwd(curr_img)
+            H_U = self.h_fun_fwd(curr_img)
             E_couple = other_img - H_U
             
             # 【核心改动】使用动态卷积模拟 H^T
             # 输入是误差 E，权重是专门预测出来的 w_bwd
-            term_couple = self.dyn_conv(E_couple, w_bwd)
+            term_couple = self.h_fun_bwd(E_couple)
             
             grad_couple = -lam * term_couple
             
         else: # mode == 'V'
             # V 的梯度依然简单
-            H_U = h_func_fwd(other_img)
-            E_couple = curr_img - H_U
+            H_V = self.h_fun_fwd(other_img)
+            E_couple = curr_img - H_V
             grad_couple = lam * E_couple
 
         # 4. 总梯度
@@ -649,7 +624,6 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.mu_c = nn.Parameter(self._inverse_softplus_tensor(mu_c))
         
         # 动态卷积算子 (RGB版)
-        self.dyn_conv_op = DynamicConv2d_RGB(channels=channels, kernel_size=3)
         self.cross_grad_prior = CrossGradientPrior(channels=channels, q_max=q_max_c)
         
         # 模块列表
@@ -659,8 +633,7 @@ class DB_ADMM_Net_RGB(nn.Module):
         # H_Predictor 输入6通道(3+3)，输出3通道动态核
         self.h_pred = nn.ModuleList([H_Predictor(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
         
-        self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
-        self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
+        self.grad_calc = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         
         # SolverNet 输入6通道(3+3)
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
@@ -685,14 +658,9 @@ class DB_ADMM_Net_RGB(nn.Module):
         for k in range(self.num_stages):
             Fu_C, Fv_C, C_map = self.cross_grad_prior(U, V, p=self.p_c, eps=self.eps_c)
 
-            # 预测 H (RGB Dynamic Kernels for Forward and Backward)
-            w_fwd, w_bwd = self.h_pred[k](U, V) # w_fwd是正向核，w_bwd是反向核
-            h_func_fwd = lambda x: self.dyn_conv_op(x, w_fwd)
-            
             # --- Step U ---
-            F_u_val, Z_u = self.grad_calc_u[k](
+            F_u_val, Z_u = self.grad_calc[k](
                 U, V, J_u, Y_u, 
-                h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_u[k], 
                 rho, lam, mode='U', cross_grad_term=Fu_C, mu=mu_c
             )
@@ -703,9 +671,8 @@ class DB_ADMM_Net_RGB(nn.Module):
             U = U + delta_U
             
             # --- Step V ---
-            F_v_val, Z_v = self.grad_calc_v[k](
+            F_v_val, Z_v = self.grad_calc[k](
                 V, U, J_v, Y_v, 
-                h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_v[k], 
                 rho, lam, mode='V', cross_grad_term=Fv_C, mu=mu_c
             )
