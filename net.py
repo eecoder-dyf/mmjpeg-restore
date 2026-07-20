@@ -405,29 +405,46 @@ class Gradient_Calculator(nn.Module):
 # ==========================================
 
 class Solver_V(nn.Module):
-    def __init__(self, in_channels=3, hidden_dim=16):
+    """
+    Lightweight encoder-decoder for V-branch residual correction.
+
+    There is no encoder-to-decoder skip connection. The analytical update
+    remains the main path, while the network predicts a nonlinear correction
+    from V, its total gradient, and the cross-gradient prior.
+    """
+    def __init__(self, in_channels=3, base_dim=16):
         super().__init__()
-        
-        # 输入: V_prev (in_channels) + F_v (in_channels)
-        self.proj_in = nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1)
-        
-        # 大核深度可分离卷积 + 归一化 (核心救命稻草！)
-        self.spatial_refine = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=hidden_dim),
-            # 使用 GroupNorm(1, ...) 等价于视觉任务中最稳的 LayerNorm
-            nn.GroupNorm(1, hidden_dim), 
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+
+        # Input: concat(V_prev, F_v, Fv_C), three in_channels tensors.
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels * 3, base_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim),
         )
-        
-        self.proj_out = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
-        
-        nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.001)
-        nn.init.constant_(self.proj_out.bias, 0.0)
+
+        self.down = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim * 2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.bottleneck = ResBlock(base_dim * 2)
+
+        self.up_conv = nn.Sequential(
+            nn.Conv2d(base_dim * 2, base_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.decoder = ResBlock(base_dim)
+        self.proj_out = nn.Conv2d(base_dim, in_channels, kernel_size=3, padding=1)
 
         self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
 
-    def forward(self, V_prev, F_v, lambda_val, rho_val):
+        # Start training from the analytical update and learn the correction
+        # progressively, following Solver_U's stable output initialization.
+        nn.init.constant_(self.proj_out.weight, 0.0)
+        nn.init.constant_(self.proj_out.bias, 0.0)
+
+    def forward(self, V_prev, F_v, Fv_C, lambda_val, rho_val):
         """
         显式传入变分参数 lambda_val 和 rho_val。
         解析步对应原二次部分，网络残差补偿非光滑 C 项与动态耦合误差。
@@ -439,11 +456,20 @@ class Solver_V(nn.Module):
         delta_V_math = - analytical_step * F_v
         
         # ==========================================
-        # Step 2: 轻量级残差提纯 (精准制导)
-        x = torch.cat([V_prev, F_v], dim=1)
-        
-        feat = self.proj_in(x)
-        feat = self.spatial_refine(feat)
+        # Step 2: 无 Encoder-Decoder skip connection 的轻量级残差修正
+        x = torch.cat([V_prev, F_v, Fv_C], dim=1)
+
+        feat = self.encoder(x)
+        feat = self.down(feat)
+        feat = self.bottleneck(feat)
+        feat = F.interpolate(
+            feat,
+            size=V_prev.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        feat = self.up_conv(feat)
+        feat = self.decoder(feat)
         residual_correction = self.proj_out(feat)
         
         # ==========================================
@@ -476,9 +502,9 @@ class DB_ADMM_Net_RGB(nn.Module):
         
         self.grad_calc = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         
-        # SolverNet 输入6通道(3+3)
+        # Solver_U 输入6通道；Solver_V 在 forward 中拼接为9通道(3+3+3)
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
-        self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
+        self.solver_v = nn.ModuleList([Solver_V(in_channels=channels, base_dim=16) for _ in range(num_stages)])
 
     @staticmethod
     def _inverse_softplus_tensor(value):
@@ -518,7 +544,7 @@ class DB_ADMM_Net_RGB(nn.Module):
                 rho, lam, mode='V', cross_grad_term=Fv_C, mu=mu_c
             )
             
-            delta_V = self.solver_v[k](V, F_v_val, lam, rho)
+            delta_V = self.solver_v[k](V, F_v_val, Fv_C, lam, rho)
             V = V + delta_V
             
             # --- Step Y ---
