@@ -54,6 +54,18 @@ def get_model_attr(model, name):
     return getattr(get_base_model(model), name)
 
 
+def build_stage_weights(num_stages, mode):
+    if num_stages < 1:
+        raise ValueError(f'num_stages must be at least 1, got {num_stages}')
+    if mode == 'constant':
+        return [1.0] * num_stages
+    if mode == 'last':
+        return [0.0] * (num_stages - 1) + [1.0]
+    if mode == 'lgcnet':
+        return [1.0] if num_stages == 1 else [1.0 / (num_stages - 1)] * (num_stages - 1) + [1.0]
+    raise ValueError(f'Unsupported stage weight mode: {mode}')
+
+
 def compute_stage_losses(outputs, u_gt, v_gt, loss_fn, stage_weights, p_c, eps_c):
     rec_loss = 0
     c_loss = 0
@@ -274,7 +286,9 @@ def main(args):
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.2, mode='min', patience=20, cooldown=20, min_lr=1e-6)
 
-    stage_weights = [1.0] * args.num_stages
+    stage_weights = build_stage_weights(args.num_stages, args.loss_mode)
+    print(f"Loss mode: {args.loss_mode}")
+    print(f"Stage weights: {stage_weights}")
     start_epoch = args.start_epoch
     saved_best_psnr = None
     val_loss_window = []
@@ -417,6 +431,7 @@ if __name__ == '__main__':
     parser.add_argument('--val_patch_size', type=int, default=None, help='Patch size for validation (center crop). If None, use full image.')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_stages', type=int, default=4, help='Number of stages in the network')
+    parser.add_argument('--loss_mode', choices=['constant', 'last', 'lgcnet'], default='constant', help='Stage loss mode')
     parser.add_argument('--mu_c', type=float, default=0.01, help='Initial weight for the cross-gradient prior term')
     parser.add_argument('--p_c', type=float, default=0.8, help='Exponent for the cross-gradient prior')
     parser.add_argument('--eps_c', type=float, default=1e-3, help='Epsilon for the cross-gradient prior')
