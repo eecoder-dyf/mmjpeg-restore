@@ -250,14 +250,14 @@ def main(args):
 
     # --- 数据加载 ---
     modalities = ['rgb', 'nir']
+    print(f"Training QFs: {args.qf}; validation QFs use fixed per-sample sampling")
     train_dataset = MultiModal_Dataset(
         root_dir=args.data_root,
         modalities=modalities,
         patch_size=args.patch_size,
         is_train=True,
         jpeg_compress_modalities=args.jpeg_modalities,
-        quality_min=args.qf,
-        quality_max=args.qf
+        quality_factors=args.qf
     )
     val_dataset = MultiModal_Dataset(
         root_dir=args.data_root,
@@ -265,8 +265,7 @@ def main(args):
         patch_size=args.val_patch_size,
         is_train=False,
         jpeg_compress_modalities=args.jpeg_modalities,
-        quality_min=args.qf,
-        quality_max=args.qf
+        quality_factors=args.qf
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
@@ -442,7 +441,7 @@ if __name__ == '__main__':
 
     # JPEG-related arguments
     parser.add_argument('--jpeg_modalities', nargs='+', default=['rgb', 'nir'], help='List of modalities to apply JPEG compression (e.g., rgb nir)')
-    parser.add_argument('--qf', type=int, default=40, help='Fixed JPEG quality factor for compression')
+    parser.add_argument('--qf', type=int, nargs='+', default=[40], help='JPEG quality factors sampled during training')
     
     args = parser.parse_args()
     main(args)

@@ -59,7 +59,7 @@ class MultiModal_Dataset(data.Dataset):
     支持多模态图像加载的类，并额外支持对指定模态的 JPEG 压缩处理。
     """
     def __init__(self, root_dir, modalities=['rgb', 'nir'], patch_size=128, augment=True, is_train=True,
-                 jpeg_compress_modalities=None, quality_min=30, quality_max=80):
+                 jpeg_compress_modalities=None, quality_min=30, quality_max=80, quality_factors=None):
         """
         Args:
             root_dir (str): 数据集根目录
@@ -70,6 +70,7 @@ class MultiModal_Dataset(data.Dataset):
             jpeg_compress_modalities (list): 指定需要进行 JPEG 压缩的模态列表
             quality_min (int): 压缩质量的最低值
             quality_max (int): 压缩质量的最高值
+            quality_factors (list): 离散压缩质量列表；训练时随机选取，验证时按样本固定随机选取
         """
         super(MultiModal_Dataset, self).__init__()
         self.patch_size = patch_size
@@ -84,6 +85,9 @@ class MultiModal_Dataset(data.Dataset):
                 raise ValueError(f"JPEG compress modality '{modality}' not found in modalities: {self.modalities}")
         self.quality_min = quality_min
         self.quality_max = quality_max
+        self.quality_factors = quality_factors
+        if quality_factors and any(qf < 0 or qf > 100 for qf in quality_factors):
+            raise ValueError(f"JPEG quality factors must be in [0, 100], got {quality_factors}")
 
         # 根据训练/测试模式确定数据路径
         split_folder = 'train' if is_train else 'test'
@@ -152,15 +156,16 @@ class MultiModal_Dataset(data.Dataset):
         return_dict["filename"] = base_name
 
         # 4. 对指定模态进行JPEG压缩，生成LQ输入
-        for modality in self.jpeg_compress_modalities:
-            modality_idx = self.modalities.index(modality)
-            img_to_compress = img_gt_list[modality_idx]
-            
-            quality = random.randint(self.quality_min, self.quality_max) if self.is_train else self.quality_max
-            img_lq = jpeg_compress(img_to_compress, quality)
-            
-            # 将LQ图像添加到返回字典
-            return_dict[f"{modality}_lq"] = np2tensor([img_lq])[0]
+        if self.jpeg_compress_modalities:
+            if self.quality_factors:
+                quality = random.choice(self.quality_factors) if self.is_train else random.Random(index).choice(self.quality_factors)
+            else:
+                quality = random.randint(self.quality_min, self.quality_max) if self.is_train else self.quality_max
+
+            for modality in self.jpeg_compress_modalities:
+                modality_idx = self.modalities.index(modality)
+                img_lq = jpeg_compress(img_gt_list[modality_idx], quality)
+                return_dict[f"{modality}_lq"] = np2tensor([img_lq])[0]
 
         return return_dict
 
