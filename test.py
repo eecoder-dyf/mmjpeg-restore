@@ -1,5 +1,6 @@
 import os
 import argparse
+import csv
 import torch
 import torch.nn.functional as F # 导入 F
 from torch.utils.data import DataLoader
@@ -63,13 +64,23 @@ def main(args):
     results_path = os.path.join(experiment_path, f'results_qf{args.qf}')
     if args.save_images:
         os.makedirs(results_path, exist_ok=True)
+        save_dirs = {
+            "rgb_restored": os.path.join(results_path, "rgb_restored"),
+            "nir_restored": os.path.join(results_path, "nir_restored"),
+            "rgb_lq": os.path.join(results_path, "rgb_lq"),
+            "nir_lq": os.path.join(results_path, "nir_lq"),
+        }
+        for path in save_dirs.values():
+            os.makedirs(path, exist_ok=True)
 
     if not os.path.exists(checkpoint_file):
         print(f"Error: Checkpoint file not found at {checkpoint_file}")
         return
 
     # --- 设备设置 ---
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for testing")
+    device = torch.device('cuda')
     print(f"Using device: {device}")
 
     # --- 数据加载 (不裁剪) ---
@@ -109,6 +120,11 @@ def main(args):
     # --- 测试循环 ---
     total_psnr_u, total_ssim_u = 0.0, 0.0
     total_psnr_v, total_ssim_v = 0.0, 0.0
+    total_inference_time = 0.0
+    num_inferences = 0
+    image_metrics = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     
     with torch.no_grad():
         pbar = tqdm(test_loader, desc=f'Testing QF={args.qf}')
@@ -122,8 +138,15 @@ def main(args):
             ori_h, ori_w = u_lq.shape[2:]
             u_lq = pad_to_multiple(u_lq, 4)
             v_lq = pad_to_multiple(v_lq, 4)
-            # 前向传播
+
+            # 只统计网络前向传播时间
+            start_event.record()
             outputs = model(u_lq, v_lq)
+            end_event.record()
+            torch.cuda.synchronize()
+            total_inference_time += start_event.elapsed_time(end_event) / 1000.0
+            num_inferences += 1
+
             u_restored, v_restored, _, _, _ = outputs[-1]
 
             # 裁剪恢复的图像和 GT 至原始尺寸
@@ -145,17 +168,14 @@ def main(args):
 
             # 保存图像
             if args.save_images:
-                save_dirs = {
-                    "rgb_restored": os.path.join(results_path, "rgb_restored"),
-                    "nir_restored": os.path.join(results_path, "nir_restored"),
-                    "rgb_lq": os.path.join(results_path, "rgb_lq"),
-                    "nir_lq": os.path.join(results_path, "nir_lq"),
-                    # "rgb_gt": os.path.join(results_path, "rgb_gt"),
-                    # "nir_gt": os.path.join(results_path, "nir_gt"),
-                }
-                for path in save_dirs.values():
-                    os.makedirs(path, exist_ok=True)
                 base_filename = batch["filename"][0]
+                image_metrics.append([
+                    base_filename,
+                    f"{psnr_u:.6f}",
+                    f"{psnr_v:.6f}",
+                    f"{ssim_u:.6f}",
+                    f"{ssim_v:.6f}",
+                ])
                 # 保存的图像是裁剪后的
                 cv2.imwrite(os.path.join(save_dirs["rgb_restored"], f"{base_filename}.png"), tensor2img(u_restored))
                 cv2.imwrite(os.path.join(save_dirs["nir_restored"], f"{base_filename}.png"), tensor2img(v_restored))
@@ -171,9 +191,18 @@ def main(args):
     avg_ssim_u = total_ssim_u / num_images
     avg_psnr_v = total_psnr_v / num_images
     avg_ssim_v = total_ssim_v / num_images
+    avg_inference_time = total_inference_time / num_inferences
+
+    if args.save_images:
+        csv_path = os.path.join(results_path, "metrics.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["image_name", "PSNR-VIS", "PSNR-NIR", "SSIM-VIS", "SSIM-NIR"])
+            writer.writerows(image_metrics)
 
     print("\n--- Test Results ---")
     print(f"QF: {args.qf}")
+    print(f"Average inference time: {avg_inference_time * 1000:.3f} ms/image")
     print(f"Modality 'rgb' (U):")
     print(f"  Avg PSNR: {avg_psnr_u:.2f} dB")
     print(f"  Avg SSIM: {avg_ssim_u:.4f}")
@@ -182,6 +211,7 @@ def main(args):
     print(f"  Avg SSIM: {avg_ssim_v:.4f}")
     if args.save_images:
         print(f"\nRestored images saved to: {results_path}")
+        print(f"Per-image metrics saved to: {csv_path}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test DB-ADMM-Net for Multi-Modal JPEG Restoration')
