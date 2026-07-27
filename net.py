@@ -6,43 +6,6 @@ import torch.nn.functional as F
 # 1. 基础组件 (Basic Components)
 # ==========================================
 
-class DynamicConv2d_RGB(nn.Module):
-    """
-    [升级版] 支持多通道的像素级动态卷积
-    采用 Depthwise 策略：每个通道拥有独立的动态核
-    """
-    def __init__(self, channels=3, kernel_size=3):
-        super().__init__()
-        self.channels = channels
-        self.ks = kernel_size
-        self.pad = kernel_size // 2
-
-    def forward(self, x, weights):
-        """
-        x: [B, 3, H, W]
-        weights: [B, 3 * K*K, H, W] -> 每个通道独立的 K*K 核
-        """
-        B, C, H, W = x.shape
-        
-        # 1. Unfold Input -> [B, C*K*K, HW]
-        # x_unfold 包含了每个像素周围的 K*K 邻域
-        x_unfold = F.unfold(x, self.ks, padding=self.pad)
-        
-        # 2. Reshape Input & Weights for Depthwise Operation
-        # x_unfold: [B, C, K*K, HW]
-        x_unfold = x_unfold.view(B, C, self.ks**2, H * W)
-        
-        # weights: [B, C, K*K, HW]
-        w_reshape = weights.view(B, C, self.ks**2, H * W)
-        
-        # 3. Apply Weights (Pixel-wise Dot Product & Sum over kernel window)
-        # 对应位置相乘，并在 K*K 维度上求和 -> 卷积操作
-        out = (x_unfold * w_reshape).sum(dim=2) 
-        
-        # 4. Reshape back to Image
-        out = out.view(B, C, H, W)
-        return out
-
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -53,165 +16,9 @@ class ResBlock(nn.Module):
         )
     def forward(self, x):
         return x + self.conv(x)
-
-class WindowAttention(nn.Module):
-    """
-    基于窗口的自注意力机制 (用于瓶颈层的全局交互)
-    """
-    def __init__(self, dim, window_size, num_heads):
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size  # (Wh, Ww)
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x):
-        """
-        Input: [B*num_windows, N, C]
-        """
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B_, nH, N, C/nH]
-
-        q = q * self.scale
-        attn = self.softmax(q @ k.transpose(-2, -1)) # [B_, nH, N, N]
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        return x
-
-class TransformerBlock(nn.Module):
-    """Transformer Block with Window Attention"""
-    def __init__(self, dim, window_size, num_heads, mlp_ratio=4.):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowAttention(dim, window_size=window_size, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Linear(int(dim * mlp_ratio), dim)
-        )
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-    def forward(self, x):
-        return self.net(x)
-
 # ==========================================
 # 2. 功能子网络 (Sub-Networks)
 # ==========================================
-
-class H_Predictor(nn.Module):
-    def __init__(self, in_channels=6, out_channels=3, kernel_size=3, 
-                 base_dim=32, window_size=8, num_heads=4):
-        super().__init__()
-        self.window_size = window_size
-        self.out_dim = out_channels * kernel_size**2
-        
-        # --- Encoder (CNN) ---
-        # Level 1 (H, W)
-        self.stem = nn.Conv2d(in_channels, base_dim, 3, 1, 1)
-        self.enc1 = ConvBlock(base_dim, base_dim)
-        
-        # Down 1 -> Level 2 (H/2, W/2)
-        self.down1 = nn.Conv2d(base_dim, base_dim*2, 3, stride=2, padding=1)
-        self.enc2 = ConvBlock(base_dim*2, base_dim*2)
-        
-        # Down 2 -> Level 3 (H/4, W/4)
-        self.down2 = nn.Conv2d(base_dim*2, base_dim*4, 3, stride=2, padding=1)
-        
-        # --- Bottleneck (Transformer / Cross-Interaction) ---
-        # 在 1/4 尺度上进行全局/大窗口交互
-        self.bottleneck = nn.ModuleList([
-            TransformerBlock(dim=base_dim*4, window_size=(window_size, window_size), num_heads=num_heads),
-            TransformerBlock(dim=base_dim*4, window_size=(window_size, window_size), num_heads=num_heads)
-        ])
-        
-        # --- Decoder (CNN) ---
-        # Up 1 -> Level 2
-        self.up1 = nn.Conv2d(base_dim*4, base_dim*2, 1) # Reduce channels
-        self.dec1 = ConvBlock(base_dim*4, base_dim*2)   # Input = Cat(Up, Enc2)
-        
-        # Up 2 -> Level 1
-        self.up2 = nn.Conv2d(base_dim*2, base_dim, 1)
-        self.dec2 = ConvBlock(base_dim*2, base_dim)     # Input = Cat(Up, Enc1)
-        
-        # --- Output Head ---
-        self.head = nn.Conv2d(base_dim, self.out_dim * 2, 1)
-
-    def forward_transformer(self, x):
-        """Helper to handle window partitioning for transformer"""
-        B, C, H, W = x.shape
-        # Pad to be divisible by window_size
-        pad_h = (self.window_size - H % self.window_size) % self.window_size
-        pad_w = (self.window_size - W % self.window_size) % self.window_size
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-        H_pad, W_pad = x.shape[2], x.shape[3]
-
-        # Partition: [B, C, H, W] -> [B*num_windows, Wh*Ww, C]
-        x_win = x.permute(0, 2, 3, 1).view(B, H_pad // self.window_size, self.window_size, W_pad // self.window_size, self.window_size, C)
-        x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
-        
-        # Apply Transformer Blocks
-        for blk in self.bottleneck:
-            x_win = blk(x_win)
-            
-        # Reverse: [B*num_windows, Wh*Ww, C] -> [B, C, H, W]
-        x = x_win.view(B, H_pad // self.window_size, W_pad // self.window_size, self.window_size, self.window_size, C)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, H_pad, W_pad)
-        
-        if pad_h > 0 or pad_w > 0:
-            x = x[:, :, :H, :W]
-        return x
-
-    def forward(self, u, v):
-        # 1. Early Fusion
-        x = torch.cat([u, v], dim=1) # [B, 6, H, W]
-        
-        # 2. Encoder Path
-        f1 = self.enc1(self.stem(x))        # Level 1
-        f2 = self.enc2(self.down1(f1))      # Level 2
-        f3 = self.down2(f2)                 # Level 3 (Bottleneck Input)
-        
-        # 3. Bottleneck (Transformer Interaction)
-        # 这里进行 Cross-Modal Context Modeling
-        feat_bot = self.forward_transformer(f3)
-        
-        # 4. Decoder Path
-        # Up 1
-        up1 = F.interpolate(feat_bot, size=f2.shape[-2:], mode='bilinear', align_corners=False)
-        up1 = self.up1(up1)
-        cat1 = torch.cat([up1, f2], dim=1)
-        dec1 = self.dec1(cat1)
-        
-        # Up 2
-        up2 = F.interpolate(dec1, size=f1.shape[-2:], mode='bilinear', align_corners=False)
-        up2 = self.up2(up2)
-        cat2 = torch.cat([up2, f1], dim=1)
-        dec2 = self.dec2(cat2)
-        
-        # 5. Prediction
-        kernels = self.head(dec2)
-        w_fwd, w_bwd = torch.chunk(kernels, 2, dim=1)
-        
-        return w_fwd, w_bwd
 
 class SoftThresholding(nn.Module):
     """
@@ -417,13 +224,25 @@ class Gradient_Calculator(nn.Module):
     """
     计算 F(U) (3通道版本)
     """
-    def __init__(self, channels=3):
+    def __init__(self, channels=3, hidden_dim=16):
         super().__init__()
-        # self.approx_HT = Approx_Trans_Block(in_channels=channels) # 移除
-        self.dyn_conv = DynamicConv2d_RGB(channels=channels)
+        self.h_fun_fwd = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=3, padding=1, bias=False, padding_mode='reflect')
+        )
+
+        self.h_fun_bwd = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
+            nn.LeakyReLU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=3, padding=1, bias=False, padding_mode='reflect')
+        )
 
     def forward(self, curr_img, other_img, J_obs, Y_dual, 
-                h_func_fwd, w_bwd, # 输入变为: 正向函数 + 反向权重
                 prior_net, rho, lam, mode='U'):
         
         # 1. 嵌入式先验梯度 (Z-Step)
@@ -437,19 +256,19 @@ class Gradient_Calculator(nn.Module):
         # 3. 耦合梯度 (Symmetric Dynamic Stream)
         if mode == 'U':
             # E = V - H(U)
-            H_U = h_func_fwd(curr_img)
+            H_U = self.h_fun_fwd(curr_img)
             E_couple = other_img - H_U
             
             # 【核心改动】使用动态卷积模拟 H^T
             # 输入是误差 E，权重是专门预测出来的 w_bwd
-            term_couple = self.dyn_conv(E_couple, w_bwd)
+            term_couple = self.h_fun_bwd(E_couple)
             
             grad_couple = -lam * term_couple
             
         else: # mode == 'V'
             # V 的梯度依然简单
-            H_U = h_func_fwd(other_img)
-            E_couple = curr_img - H_U
+            H_V = self.h_fun_fwd(other_img)
+            E_couple = curr_img - H_V
             grad_couple = lam * E_couple
 
         # 4. 总梯度
@@ -462,30 +281,49 @@ class Gradient_Calculator(nn.Module):
 # ==========================================
 
 class Solver_V(nn.Module):
-    def __init__(self, in_channels=3, hidden_dim=16):
+    """
+    Lightweight encoder-decoder for V-branch residual correction.
+
+    There is no encoder-to-decoder skip connection. The analytical update
+    remains the main path, while the network predicts a nonlinear correction
+    from V and its total gradient.
+    """
+    def __init__(self, in_channels=3, base_dim=16):
         super().__init__()
-        
-        self.proj_in = nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1)
-        
-        # 大核深度可分离卷积 + 归一化 (核心救命稻草！)
-        self.spatial_refine = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=hidden_dim),
-            # 使用 GroupNorm(1, ...) 等价于视觉任务中最稳的 LayerNorm
-            nn.GroupNorm(1, hidden_dim), 
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+
+        # Input: concat(V_prev, F_v), two in_channels tensors.
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels * 2, base_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            ResBlock(base_dim),
         )
-        
-        self.proj_out = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
-        
-        nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.001)
-        nn.init.constant_(self.proj_out.bias, 0.0)
+
+        self.down = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim * 2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.bottleneck = ResBlock(base_dim * 2)
+
+        self.up_conv = nn.Sequential(
+            nn.Conv2d(base_dim * 2, base_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.decoder = ResBlock(base_dim)
+        self.proj_out = nn.Conv2d(base_dim, in_channels, kernel_size=3, padding=1)
 
         self.alpha = nn.Parameter(torch.tensor([0.2]))  # 可学习的融合权重
 
+        # Start training from the analytical update and learn the correction
+        # progressively, following Solver_U's stable output initialization.
+        nn.init.constant_(self.proj_out.weight, 0.0)
+        nn.init.constant_(self.proj_out.bias, 0.0)
+
     def forward(self, V_prev, F_v, lambda_val, rho_val):
         """
-        显式传入变分参数 lambda_val 和 rho_val
+        显式传入变分参数 lambda_val 和 rho_val。
+        解析步对应原二次部分，网络残差补偿动态耦合误差。
         """
         # ==========================================
         # Step 1: 严格保留数学解析逆计算
@@ -494,11 +332,20 @@ class Solver_V(nn.Module):
         delta_V_math = - analytical_step * F_v
         
         # ==========================================
-        # Step 2: 轻量级残差提纯 (精准制导)
+        # Step 2: 无 Encoder-Decoder skip connection 的轻量级残差修正
         x = torch.cat([V_prev, F_v], dim=1)
-        
-        feat = self.proj_in(x)
-        feat = self.spatial_refine(feat)
+
+        feat = self.encoder(x)
+        feat = self.down(feat)
+        feat = self.bottleneck(feat)
+        feat = F.interpolate(
+            feat,
+            size=V_prev.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        feat = self.up_conv(feat)
+        feat = self.decoder(feat)
         residual_correction = self.proj_out(feat)
         
         # ==========================================
@@ -516,25 +363,23 @@ class DB_ADMM_Net_RGB(nn.Module):
         self.channels = channels
         
         # 参数
-        self.rho = nn.Parameter(torch.tensor([0.1]))
-        self.lam = nn.Parameter(torch.tensor([0.5]))
-        
-        # 动态卷积算子 (RGB版)
-        self.dyn_conv_op = DynamicConv2d_RGB(channels=channels, kernel_size=3)
+        self.rho = nn.Parameter(self._inverse_softplus_tensor(0.1))
+        self.lam = nn.Parameter(self._inverse_softplus_tensor(0.5))
         
         # 模块列表
         self.prior_u = nn.ModuleList([PriorNet(channels) for _ in range(num_stages)])
         self.prior_v = nn.ModuleList([PriorNet(channels) for _ in range(num_stages)])
         
-        # H_Predictor 输入6通道(3+3)，输出3通道动态核
-        self.h_pred = nn.ModuleList([H_Predictor(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
+        self.grad_calc = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
         
-        self.grad_calc_u = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
-        self.grad_calc_v = nn.ModuleList([Gradient_Calculator(channels) for _ in range(num_stages)])
-        
-        # SolverNet 输入6通道(3+3)
+        # Solver_U 与 Solver_V 的输入均为6通道(3+3)
         self.solver_u = nn.ModuleList([SolverNet(in_channels=channels*2, out_channels=channels) for _ in range(num_stages)])
-        self.solver_v = nn.ModuleList([Solver_V(in_channels=channels) for _ in range(num_stages)]) 
+        self.solver_v = nn.ModuleList([Solver_V(in_channels=channels, base_dim=16) for _ in range(num_stages)])
+
+    @staticmethod
+    def _inverse_softplus_tensor(value):
+        value = torch.tensor([value], dtype=torch.float32)
+        return torch.log(torch.expm1(value))
 
     def forward(self, J_u, J_v):
         # [B, 3, H, W]
@@ -543,18 +388,15 @@ class DB_ADMM_Net_RGB(nn.Module):
         Y_v = torch.zeros_like(V)
         
         outputs = []
+        rho = F.softplus(self.rho)
+        lam = F.softplus(self.lam)
         
         for k in range(self.num_stages):
-            # 预测 H (RGB Dynamic Kernels for Forward and Backward)
-            w_fwd, w_bwd = self.h_pred[k](U, V) # w_fwd是正向核，w_bwd是反向核
-            h_func_fwd = lambda x: self.dyn_conv_op(x, w_fwd)
-            
             # --- Step U ---
-            F_u_val, Z_u = self.grad_calc_u[k](
+            F_u_val, Z_u = self.grad_calc[k](
                 U, V, J_u, Y_u, 
-                h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_u[k], 
-                self.rho, self.lam, mode='U'
+                rho, lam, mode='U'
             )
             
             # Solver: Concat [U(3), Fu(3)]
@@ -563,19 +405,18 @@ class DB_ADMM_Net_RGB(nn.Module):
             U = U + delta_U
             
             # --- Step V ---
-            F_v_val, Z_v = self.grad_calc_v[k](
+            F_v_val, Z_v = self.grad_calc[k](
                 V, U, J_v, Y_v, 
-                h_func_fwd, w_bwd, # Pass both forward func and backward weights
                 self.prior_v[k], 
-                self.rho, self.lam, mode='V'
+                rho, lam, mode='V'
             )
             
-            delta_V = self.solver_v[k](V, F_v_val, self.lam, self.rho)
+            delta_V = self.solver_v[k](V, F_v_val, lam, rho)
             V = V + delta_V
             
             # --- Step Y ---
-            Y_u = Y_u + self.rho * (U - Z_u)
-            Y_v = Y_v + self.rho * (V - Z_v)
+            Y_u = Y_u + rho * (U - Z_u)
+            Y_v = Y_v + rho * (V - Z_v)
             
             outputs.append((U, V, F_u_val, F_v_val))
 
